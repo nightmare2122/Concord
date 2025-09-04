@@ -32,7 +32,7 @@ Each bot is backed by its **own database** for modularity and easy maintenance.
   - GitHub → Webhook (Flask + ngrok) → Host PC  
   - Auto-pulls code on commit  
   - Restarts bots with near-zero downtime  
-- **NAS integration** for centralized storage & remote access  
+- **NAS integration** for on site secure and centralized storage & remote access  
 - **Deployment scripts** for monitoring, restarts, and task automation  
 - **Cloud-native migration** using AWS services  
 

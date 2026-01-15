@@ -72,7 +72,7 @@ The project is transitioning into AWS for scalability:
 
 ---
 
-## 📈 Skills & Concepts Demonstrated  
+## 📈 Skills & Concepts  
 - Python **scripting & automation**  
 - Building **CI/CD pipelines** (GitHub → Host → AWS)  
 - **Database design & management** (SQLite → RDS)  

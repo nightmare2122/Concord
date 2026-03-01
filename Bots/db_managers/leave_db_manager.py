@@ -5,6 +5,7 @@ import asyncio
 
 # Network path to the NAS server (or local database folder)
 nas_server_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'Database'))
+os.makedirs(nas_server_path, exist_ok=True)
 db_leave_details_path = os.path.join(nas_server_path, 'leave_details.db')
 db_dynamic_updates_path = os.path.join(nas_server_path, 'dynamic_updates.db')
 

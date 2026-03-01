@@ -4,6 +4,7 @@ import asyncio
 
 # Define the network path to the NAS
 nas_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'Database'))
+os.makedirs(nas_path, exist_ok=True)
 db_path = os.path.join(nas_path, 'tasks.db')
 
 # Function to check and create the database file

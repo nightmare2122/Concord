@@ -8,6 +8,10 @@ import logging
 import os
 import sys
 
+# Load environment variables from .env file automatically
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+
 import discord
 from discord.ext import commands
 

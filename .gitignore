@@ -21,6 +21,9 @@ Database/
 .pyre_configuration
 .pyre/
 
+# Environment secrets — NEVER commit these
+.env
+
 # Logs & temp
 *.log
 git_status.txt

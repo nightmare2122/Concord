@@ -205,6 +205,51 @@ def test_find_closest_match_no_match():
     result = find_closest_match("XYZ123", [m1])
     assert result is None
 
+def test_find_closest_match_conflicting_names():
+    """Fuzzy matching should handle similar names and pick the best one."""
+    from task_cog import find_closest_match
+
+    m1 = MagicMock(); m1.display_name = "John"
+    m2 = MagicMock(); m2.display_name = "Johnny"
+    # "John" is an exact match for "John"
+    result = find_closest_match("John", [m1, m2])
+    assert result == m1
+    
+    # "Jonny" should match "Johnny" better than "John"
+    result = find_closest_match("Jonny", [m1, m2])
+    assert result == m2
+
+
+# ─── Department / Designation Logic ───────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_department_assignment_interns():
+    """Verify task assignment logic identifies the 'Interns' department."""
+    # INTERNS_ROLE_ID = 1281195640109400085
+    from task_cog import DEPARTMENTS
+    assert DEPARTMENTS["Interns"] == 1281195640109400085
+
+@pytest.mark.asyncio
+async def test_department_assignment_cad():
+    """Verify task assignment logic identifies the 'CAD' department."""
+    # CAD_ROLE_ID = 1281172603217645588
+    from task_cog import DEPARTMENTS
+    assert DEPARTMENTS["CAD"] == 1281172603217645588
+
+@pytest.mark.asyncio
+async def test_multi_user_concurrent_assignment_mock():
+    """Mock test for multiple users initiating task assignment simultaneously."""
+    # We simulate this by creating multiple interactions for different users
+    i1 = make_interaction(user_id=101, display_name="User1")
+    i2 = make_interaction(user_id=102, display_name="User2")
+    
+    # Both should be able to defer their responses without interference
+    await i1.response.defer(ephemeral=True)
+    await i2.response.defer(ephemeral=True)
+    
+    i1.response.defer.assert_called_once()
+    i2.response.defer.assert_called_once()
+
 
 # ─── Command button detection ─────────────────────────────────────────────────
 

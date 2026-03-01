@@ -201,9 +201,9 @@ class LeaveApprovalView(View):
                 elif self.current_stage == 'second':
                     await db.confirm_leave_acceptance(
                         self.nickname, self.leave_details['leave_id'],
-                        self.leave_details['leave_reason'].lower(),
-                        self.leave_details['number_of_days_off'],
-                        self.leave_details['date_to'], self.user_id,
+                        self.leave_details.get('leave_reason', 'N/A').lower(),
+                        self.leave_details.get('number_of_days_off', 0.0),
+                        self.leave_details.get('date_to', self.leave_details.get('date_from', 'N/A')), self.user_id,
                     )
                     new_footer = f"Stage: third | User ID: {self.user_id} | Nickname: {self.nickname} | Channel ID: {APPROVAL_CHANNELS['pa']} | Message ID: {interaction.message.id}"
                     embed.set_footer(text=new_footer)
@@ -220,9 +220,9 @@ class LeaveApprovalView(View):
                 elif self.current_stage == 'third':
                     await db.confirm_leave_acceptance(
                         self.nickname, self.leave_details['leave_id'],
-                        self.leave_details['leave_reason'].lower(),
-                        self.leave_details['number_of_days_off'],
-                        self.leave_details['date_to'], self.user_id,
+                        self.leave_details.get('leave_reason', 'N/A').lower(),
+                        self.leave_details.get('number_of_days_off', 0.0),
+                        self.leave_details.get('date_to', self.leave_details.get('date_from', 'N/A')), self.user_id,
                     )
                     new_footer = f"Stage: final | User ID: {self.user_id} | Nickname: {self.nickname} | Channel ID: {APPROVAL_CHANNELS['pa']} | Message ID: {interaction.message.id}"
                     embed.set_footer(text=new_footer)
@@ -371,11 +371,14 @@ class FullDayLeaveModal(Modal):
                 'date_from': date_from, 'date_to': date_to,
                 'number_of_days_off': number_of_days_off, 'resume_office_on': resume_office_on,
             }
+            
+            await interaction.response.defer(ephemeral=True)
+            
             data = (leave_details['leave_type'], leave_details['leave_reason'], date_from, date_to, number_of_days_off, resume_office_on, None, "PENDING", None)
             leave_id = await db.submit_leave_application(nickname, leave_details, data)
             leave_details['leave_id'] = leave_id
             await send_leave_application_to_approval_channel(interaction, leave_details, [r.id for r in interaction.user.roles])
-            await interaction.response.send_message(f"FULL DAY LEAVE SUBMITTED. LEAVE ID: {leave_id}", ephemeral=True)
+            await interaction.followup.send(f"FULL DAY LEAVE SUBMITTED. LEAVE ID: {leave_id}", ephemeral=True)
         except Exception as e:
             if not interaction.response.is_done():
                 await interaction.response.send_message(f"AN ERROR OCCURRED: {e}", ephemeral=True)
@@ -414,11 +417,14 @@ class HalfDayLeaveModal(Modal):
                 'date_from': date, 'date_to': None,
                 'number_of_days_off': 0.5, 'resume_office_on': None, 'time_period': time_period,
             }
+            
+            await interaction.response.defer(ephemeral=True)
+            
             data = (leave_details['leave_type'], leave_details['leave_reason'], date, None, 0.5, None, time_period, "PENDING", None)
             leave_id = await db.submit_leave_application(nickname, leave_details, data)
             leave_details['leave_id'] = leave_id
             await send_leave_application_to_approval_channel(interaction, leave_details, [r.id for r in interaction.user.roles])
-            await interaction.response.send_message(f"HALF DAY LEAVE SUBMITTED. LEAVE ID: {leave_id}", ephemeral=True)
+            await interaction.followup.send(f"HALF DAY LEAVE SUBMITTED. LEAVE ID: {leave_id}", ephemeral=True)
         except Exception as e:
             if not interaction.response.is_done():
                 await interaction.response.send_message(f"AN ERROR OCCURRED: {e}", ephemeral=True)
@@ -465,12 +471,15 @@ class OffDutyLeaveModal(Modal):
                 'date_from': date, 'date_to': None,
                 'number_of_days_off': None, 'resume_office_on': None, 'time_off': time_off,
             }
+            
+            await interaction.response.defer(ephemeral=True)
+            
             data = (leave_details['leave_type'], leave_details['leave_reason'], date, None, None, None, None, time_off, "PENDING", None)
             leave_id = await db.submit_leave_application(nickname, leave_details, data)
             leave_details['leave_id'] = leave_id
             await db.add_off_duty_hours(user_id, cumulated_hours)
             await send_leave_application_to_approval_channel(interaction, leave_details, [r.id for r in interaction.user.roles])
-            await interaction.response.send_message(f"OFF DUTY SUBMITTED. LEAVE ID: {leave_id}", ephemeral=True)
+            await interaction.followup.send(f"OFF DUTY SUBMITTED. LEAVE ID: {leave_id}", ephemeral=True)
         except Exception as e:
             if not interaction.response.is_done():
                 await interaction.response.send_message(f"AN ERROR OCCURRED: {e}", ephemeral=True)

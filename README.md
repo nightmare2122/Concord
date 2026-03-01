@@ -17,10 +17,33 @@ The project is now evolving into a **cloud-native architecture** with **AWS Lamb
 
 ---
 
-## ⚙️ Bots Included  
-- **Task Bot (`Task.py`)** → Assigning, tracking, and managing tasks
-- **Leave Bot (`Leave.py`)** → Managing employee leaves (supports full-day, half-day, and off-duty)
-- **DAR Bot (`DAR.py`)** → Data automation & reporting *(Legacy)*
+## ⚙️ Bots & Architecture  
+The project has been unified into a single application using **Discord.py Cogs**:
+- **Entry Point**: `main.py`
+- **Cogs (`/cogs/`)**:
+  - `task_cog.py` → Task assignment & tracking
+  - `leave_cog.py` → Employee leave management
+  - `dar_cog.py` → Daily Activity Reporting
+- **Shared Token**: Uses a single `BOT_TOKEN` for all features.
+
+---
+
+## 🚀 Quick Start (Linux)
+To set up the environment, install dependencies, and start the bot with a single command:
+
+1. **Configure Environment**:
+   ```bash
+   cp .env.example .env
+   # Edit .env and add your BOT_TOKEN
+   ```
+
+2. **Run the Script**:
+   ```bash
+   ./run.sh
+   ```
+*This script will automatically create a virtual environment, install requirements, and launch the bot.*
+
+---
 
 ### 🏗️ Architecture & Database Modularity
 To ensure 100% uptime and prevent "Database is locked" concurrency errors during peak Discord usage, the application enforces a strict **Controller-Service Model**:
@@ -109,6 +132,7 @@ The project is transitioning into AWS for scalability:
 - [x] Automate deployment & restarts
 - [x] Abstract all databases into isolated modular Service layers (`db_manager.py`).
 - [x] Build synchronous and AsyncMock `pytest` validation suites.
+- [x] **Unify bots into a single Cog-based application (`main.py`)**
 - [ ] Migrate databases to **AWS RDS**  
 - [ ] Deploy bots on **AWS Lambda**  
 - [ ] Replace ngrok with **AWS CodePipeline**  

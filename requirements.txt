@@ -1,0 +1,6 @@
+discord.py
+python-dotenv
+pandas
+openpyxl
+pytest
+pytest-asyncio

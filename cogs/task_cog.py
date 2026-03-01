@@ -97,7 +97,17 @@ class TaskCog(commands.Cog, name="Tasks"):
         view = ui.View(timeout=None)
         view.add_item(ui.Button(label="Assign Task", style=discord.ButtonStyle.green, custom_id="assign_task_button"))
         view.add_item(ui.Button(label="View Tasks", style=discord.ButtonStyle.primary, custom_id="view_tasks_button"))
-        await command_channel.send("Command buttons:", view=view)
+
+        embed = discord.Embed(
+            title="📋 Task Management System",
+            description="Welcome to the Concord Task Center. Please use the buttons below to manage tasks.",
+            color=0x3498db
+        )
+        embed.add_field(name="Assign Task", value="Assign a new task to a department or individual.", inline=False)
+        embed.add_field(name="View Tasks", value="View your currently pending tasks.", inline=False)
+        embed.set_footer(text="Concord Unified Engine")
+
+        await command_channel.send(embed=embed, view=view)
         logging.info("[Task] Created command buttons in command channel.")
 
     @commands.Cog.listener()

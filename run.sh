@@ -15,7 +15,7 @@ NC='\033[0m'
 set -e
 
 # Project root
-PROJECT_ROOT="/home/am.k/Concord"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
 
 clear

@@ -4,7 +4,7 @@ import re
 import asyncio
 
 # Network path to the NAS server (or local database folder)
-nas_server_path = "/home/am.k/Concord/Database"
+nas_server_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'Database'))
 db_leave_details_path = os.path.join(nas_server_path, 'leave_details.db')
 db_dynamic_updates_path = os.path.join(nas_server_path, 'dynamic_updates.db')
 
@@ -125,6 +125,16 @@ async def get_leave_status(nickname, leave_id):
             return conn.execute(f'''
                 SELECT leave_reason, number_of_days_off FROM {table_name}
                 WHERE leave_id = ? AND leave_status = 'Accepted'
+            ''', (leave_id,)).fetchone()
+    return await db_execute(_get)
+
+async def get_pending_leave_status(nickname, leave_id):
+    def _get():
+        table_name = sanitize_table_name(nickname)
+        with get_leave_conn() as conn:
+            return conn.execute(f'''
+                SELECT leave_reason, number_of_days_off FROM {table_name}
+                WHERE leave_id = ? AND leave_status = 'PENDING'
             ''', (leave_id,)).fetchone()
     return await db_execute(_get)
 

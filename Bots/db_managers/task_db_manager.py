@@ -3,7 +3,7 @@ import os
 import asyncio
 
 # Define the network path to the NAS
-nas_path = r'/home/am.k/Concord/Database'
+nas_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'Database'))
 db_path = os.path.join(nas_path, 'tasks.db')
 
 # Function to check and create the database file

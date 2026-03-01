@@ -19,7 +19,7 @@ DAR_CHANNEL_ID = 1282571345850400768
 DAR_EXCLUDE_ROLE_ID = 1282590818376482816
 
 # Linux-compatible log directory
-DAR_LOG_DIRECTORY = "/home/am.k/Concord/Database/DAR exports"
+DAR_LOG_DIRECTORY = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Database', 'DAR exports'))
 
 
 class DARCog(commands.Cog, name="DAR"):

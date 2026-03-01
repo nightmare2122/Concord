@@ -146,6 +146,99 @@ class LeaveApplicationView(View):
         await interaction.response.send_modal(WithdrawLeaveModal())
 
 
+class DMLeaveActionView(discord.ui.View):
+    def __init__(self, leave_id: int, stage: str, bot_ref=None):
+        super().__init__(timeout=None)
+        self.leave_id = leave_id
+        self.stage = stage
+        self._bot = bot_ref
+
+        if stage == 'first':
+            # Add Cancel button
+            btn = discord.ui.Button(label="Cancel Leave", style=discord.ButtonStyle.danger, custom_id=f"cancel_leave_{leave_id}")
+            btn.callback = self.cancel_leave
+            self.add_item(btn)
+        elif stage == 'second':
+            # Add Request Withdraw button
+            btn = discord.ui.Button(label="Request Withdraw", style=discord.ButtonStyle.danger, custom_id=f"req_withdraw_leave_{leave_id}")
+            btn.callback = self.request_withdraw
+            self.add_item(btn)
+
+    async def cancel_leave(self, interaction: discord.Interaction):
+        bot = self._bot or interaction.client
+        guild = bot.guilds[0]
+        member = guild.get_member(interaction.user.id)
+        nickname = member.display_name if member else interaction.user.display_name
+        
+        leave_id = self.leave_id
+        result = await db.get_pending_leave_status(nickname, leave_id)
+        if result:
+            leave_reason, number_of_days_off = result
+            await db.withdraw_leave(nickname, leave_id)
+            
+            await interaction.response.send_message(f"Leave {leave_id} cancelled successfully.", ephemeral=True)
+            for item in self.children:
+                item.disabled = True
+            await interaction.message.edit(view=self)
+            
+            try:
+                footer = await db.get_footer_text(nickname, leave_id)
+                if footer and footer[0]:
+                    parts = footer[0].split(" | ")
+                    channel_id = int(parts[3].split(": ")[1])
+                    message_id = int(parts[4].split(": ")[1])
+                    channel = bot.get_channel(channel_id)
+                    if channel:
+                        msg = await channel.fetch_message(message_id)
+                        await msg.delete()
+            except Exception as e:
+                logging.error(f"[Leave] Error deleting pending leave embed: {e}")
+        else:
+            await interaction.response.send_message(f"Leave {leave_id} not found or is no longer pending.", ephemeral=True)
+
+    async def request_withdraw(self, interaction: discord.Interaction):
+        # Trigger the withdraw modal or process request
+        leave_id = self.leave_id
+        await interaction.response.send_message(f"Withdraw request sent for Leave ID {leave_id}. Please wait for HR processing.", ephemeral=True)
+        # Real withdrawal logic handled in the main HR view, here we just notify.
+        for item in self.children:
+            item.disabled = True
+        await interaction.message.edit(view=self)
+
+
+class ApprovedActionsView(View):
+    def __init__(self, user_id, leave_details, nickname, bot_ref=None):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+        self.leave_details = leave_details
+        self.nickname = nickname
+        self._bot = bot_ref
+
+    @discord.ui.button(label="Withdraw", style=discord.ButtonStyle.danger, custom_id="withdraw_approved_leave")
+    async def withdraw_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        leave_id = self.leave_details['leave_id']
+        result = await db.get_leave_status(self.nickname, leave_id)
+        if result:
+            leave_reason, number_of_days_off = result
+            await db.withdraw_leave(self.nickname, leave_id)
+            await db.reduce_leave_balance(self.user_id, leave_reason.lower(), number_of_days_off)
+            await db.update_last_leave_date_after_withdrawal(self.nickname, self.user_id)
+            await interaction.response.send_message(f"Leave {leave_id} withdrawn.", ephemeral=True)
+            for item in self.children:
+                item.disabled = True
+            await interaction.message.edit(view=self)
+            
+            # Message user about the HR withdrawal
+            try:
+                bot = self._bot or interaction.client
+                user = await bot.fetch_user(self.user_id)
+                await user.send(f"Your leave (ID: {leave_id}) has been formally withdrawn by HR/Management.")
+            except Exception as e:
+                pass
+        else:
+            await interaction.response.send_message(f"Leave {leave_id} not found or could not be withdrawn.", ephemeral=True)
+
+
 class LeaveApprovalView(View):
     def __init__(self, user_id, leave_details, current_stage, nickname, bot_ref=None):
         super().__init__(timeout=None)
@@ -208,10 +301,9 @@ class LeaveApprovalView(View):
                     new_footer = f"Stage: third | User ID: {self.user_id} | Nickname: {self.nickname} | Channel ID: {APPROVAL_CHANNELS['pa']} | Message ID: {interaction.message.id}"
                     embed.set_footer(text=new_footer)
                     await interaction.message.edit(embed=embed)
-                    await db.update_footer_text(self.nickname, self.leave_details['leave_id'], new_footer)
                     await interaction.message.edit(
                         content="Leave Approved",
-                        view=View().add_item(Button(label="Approved", style=discord.ButtonStyle.success, disabled=True)),
+                        view=ApprovedActionsView(self.user_id, self.leave_details, self.nickname, bot_ref=bot),
                     )
                     await interaction.response.send_message("Leave approved and confirmed by HR.", ephemeral=True)
                     user = await bot.fetch_user(self.user_id)
@@ -230,7 +322,7 @@ class LeaveApprovalView(View):
                     await db.update_footer_text(self.nickname, self.leave_details['leave_id'], new_footer)
                     await interaction.message.edit(
                         content="Leave Approved",
-                        view=View().add_item(Button(label="Approved", style=discord.ButtonStyle.success, disabled=True)),
+                        view=ApprovedActionsView(self.user_id, self.leave_details, self.nickname, bot_ref=bot),
                     )
                     await interaction.response.send_message("Leave approved and confirmed by the Principal Architect.", ephemeral=True)
                     user = await bot.fetch_user(self.user_id)
@@ -330,55 +422,62 @@ class FullDayLeaveModal(Modal):
     def __init__(self):
         super().__init__(title="FULL DAY LEAVE APPLICATION")
         self.add_item(TextInput(label="LEAVE REASON", style=discord.TextStyle.short, max_length=10, placeholder="CASUAL / SICK / C. OFF"))
-        self.add_item(TextInput(label="DATE - FROM DD-MM-YYYY TO DD-MM-YYYY", style=discord.TextStyle.short, max_length=1024, placeholder="DD-MM-YYYY TO DD-MM-YYYY"))
-        self.add_item(TextInput(label="NO. OF DAYS OFF", style=discord.TextStyle.short, max_length=1024, placeholder="NUMBER OF DAYS OFF"))
-        self.add_item(TextInput(label="RESUME OFFICE ON - DD-MM-YYYY", style=discord.TextStyle.short, max_length=1024, placeholder="DD-MM-YYYY"))
+        self.add_item(TextInput(label="START DATE", style=discord.TextStyle.short, max_length=10, placeholder="DD-MM-YYYY"))
+        self.add_item(TextInput(label="END DATE", style=discord.TextStyle.short, max_length=10, placeholder="DD-MM-YYYY"))
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             nickname = interaction.user.display_name
             leave_reason = self.children[0].value.strip().upper()
-            date_range = self.children[1].value.strip().upper().split(" TO ")
-            number_of_days_off = self.children[2].value.strip()
-            resume_office_on = self.children[3].value.strip().upper()
+            date_from_str = self.children[1].value.strip().upper()
+            date_to_str = self.children[2].value.strip().upper()
 
             if leave_reason not in ["CASUAL", "SICK", "C. OFF"]:
-                await interaction.response.send_message("INVALID LEAVE REASON.", ephemeral=True)
+                await interaction.response.send_message("INVALID LEAVE REASON.", ephemeral=True, delete_after=15)
                 return
-            if len(date_range) != 2:
-                await interaction.response.send_message("INVALID DATE RANGE FORMAT.", ephemeral=True)
-                return
-            date_from, date_to = date_range
+
             try:
-                datetime.strptime(date_from, "%d-%m-%Y")
-                datetime.strptime(date_to, "%d-%m-%Y")
+                date_from = datetime.strptime(date_from_str, "%d-%m-%Y")
+                date_to = datetime.strptime(date_to_str, "%d-%m-%Y")
             except ValueError:
-                await interaction.response.send_message("INVALID DATE FORMAT. USE DD-MM-YYYY.", ephemeral=True)
+                await interaction.response.send_message("INVALID DATE FORMAT. USE DD-MM-YYYY.", ephemeral=True, delete_after=15)
                 return
-            try:
-                number_of_days_off = float(number_of_days_off)
-            except ValueError:
-                await interaction.response.send_message("INVALID NUMBER OF DAYS OFF.", ephemeral=True)
+
+            if date_from > date_to:
+                await interaction.response.send_message("START DATE CANNOT BE AFTER END DATE.", ephemeral=True, delete_after=15)
                 return
-            try:
-                datetime.strptime(resume_office_on, "%d-%m-%Y")
-            except ValueError:
-                await interaction.response.send_message("INVALID RESUME DATE FORMAT.", ephemeral=True)
-                return
+
+            # Calculate days off excluding Sundays (weekday() == 6)
+            # Adjusting per usual standard that Sunday is a weekly off
+            days_off = 0
+            current_date = date_from
+            while current_date <= date_to:
+                if current_date.weekday() != 6:  # Skip Sundays
+                    days_off += 1
+                current_date += timedelta(days=1)
+            
+            number_of_days_off = float(days_off)
+
+            # Next working day (Resume Office On)
+            resume_date = date_to + timedelta(days=1)
+            if resume_date.weekday() == 6:  # If resume date is Sunday, move to Monday
+                resume_date += timedelta(days=1)
+            
+            resume_office_on = resume_date.strftime("%d-%m-%Y")
 
             leave_details = {
                 'leave_type': 'FULL DAY', 'leave_reason': leave_reason,
-                'date_from': date_from, 'date_to': date_to,
+                'date_from': date_from_str, 'date_to': date_to_str,
                 'number_of_days_off': number_of_days_off, 'resume_office_on': resume_office_on,
             }
             
             await interaction.response.defer(ephemeral=True)
             
-            data = (leave_details['leave_type'], leave_details['leave_reason'], date_from, date_to, number_of_days_off, resume_office_on, None, "PENDING", None)
+            data = (leave_details['leave_type'], leave_details['leave_reason'], date_from_str, date_to_str, number_of_days_off, resume_office_on, None, "PENDING", None)
             leave_id = await db.submit_leave_application(nickname, leave_details, data)
             leave_details['leave_id'] = leave_id
             await send_leave_application_to_approval_channel(interaction, leave_details, [r.id for r in interaction.user.roles])
-            await interaction.followup.send(f"FULL DAY LEAVE SUBMITTED. LEAVE ID: {leave_id}", ephemeral=True)
+            await interaction.followup.send(f"FULL DAY LEAVE SUBMITTED. LEAVE ID: {leave_id}\nResume Date: {resume_office_on} ({number_of_days_off} day(s))", ephemeral=True)
         except Exception as e:
             if not interaction.response.is_done():
                 await interaction.response.send_message(f"AN ERROR OCCURRED: {e}", ephemeral=True)
@@ -514,6 +613,22 @@ async def send_leave_application_to_approval_channel(interaction, leave_details,
     await message.edit(embed=embed)
     await db.update_footer_text(interaction.user.display_name, leave_details['leave_id'], footer_text)
 
+    # Send DM to the user with Leave ID and Date
+    try:
+        user = await bot.fetch_user(interaction.user.id)
+        date_display = leave_details.get('date_from', 'N/A')
+        if leave_details.get('date_to'):
+            date_display += f" TO {leave_details['date_to']}"
+        dm_embed = discord.Embed(title="Leave Application Submitted", color=5810975)
+        dm_embed.add_field(name="Leave ID", value=leave_details['leave_id'], inline=False)
+        dm_embed.add_field(name="Date", value=date_display, inline=False)
+        
+        # Attach Cancel view for the first step
+        dm_view = DMLeaveActionView(leave_details['leave_id'], 'first', bot_ref=bot)
+        await user.send(embed=dm_embed, view=dm_view)
+    except discord.Forbidden:
+        logging.warning(f"Could not send DM to user {interaction.user.display_name}")
+
 
 # ─── Cog ─────────────────────────────────────────────────────────────────────
 
@@ -536,6 +651,19 @@ class LeaveCog(commands.Cog, name="Leave"):
             await db.create_user_table(member.display_name)
             await db.insert_dynamic_user(member.display_name, member.id)
 
+        # Create base styled embed for Leave app logic
+        leave_embed = discord.Embed(
+            title="🌴 Leave Management System",
+            description="Welcome to the Concord Leave Center. Please select your leave type using the buttons below.",
+            color=0x2ecc71
+        )
+        leave_embed.add_field(name="Full Day", value="Apply for a standard full day leave.", inline=True)
+        leave_embed.add_field(name="Half Day", value="Apply for a forenoon or afternoon half-day leave.", inline=True)
+        leave_embed.add_field(name="Off Duty", value="Apply for hourly off-duty time.", inline=True)
+        leave_embed.add_field(name="Leave Details", value="View your current leave balances.", inline=False)
+        leave_embed.add_field(name="Withdraw Leave", value="Withdraw a pending application.", inline=False)
+        leave_embed.set_footer(text="Concord Unified Engine")
+
         # Reattach submit channel buttons
         submit_channel = self.bot.get_channel(SUBMIT_CHANNEL_ID)
         found_existing = False
@@ -543,25 +671,22 @@ class LeaveCog(commands.Cog, name="Leave"):
             if (
                 message.author == self.bot.user
                 and message.embeds
-                and "Please select your leave type using the buttons given below" in message.embeds[0].title
+                and ("Leave Management System" in message.embeds[0].title or "Please select your leave type" in message.embeds[0].title)
             ):
                 view = LeaveApplicationView()
                 await asyncio.sleep(1)
-                await message.edit(view=view)
+                await message.edit(embed=leave_embed, view=view)
                 logging.info("[Leave] Reattached view to existing message in submit channel.")
                 found_existing = True
                 break
         if not found_existing:
             view = LeaveApplicationView()
             await asyncio.sleep(1)
-            await submit_channel.send(
-                embed=discord.Embed(title="Please select your leave type using the buttons given below", color=5810975),
-                view=view,
-            )
+            await submit_channel.send(embed=leave_embed, view=view)
             logging.info("[Leave] Created new leave application message in submit channel.")
 
         # Reattach approval channel buttons
-        for channel_id in APPROVAL_CHANNELS.values():
+        for channel_id in set(APPROVAL_CHANNELS.values()):
             channel = self.bot.get_channel(channel_id)
             if channel is None:
                 continue
@@ -583,10 +708,8 @@ class LeaveCog(commands.Cog, name="Leave"):
                                     nickname = parts[2].split(": ")[1]
                                     message_id = int(parts[4].split(": ")[1])
                                     view = LeaveApprovalView(user_id, leave_details, current_stage, nickname, bot_ref=self.bot)
-                                    await asyncio.sleep(1)
-                                    fetched = await channel.fetch_message(message_id)
-                                    await fetched.edit(view=view)
-                                    print(f"[Leave] Reattached approval view in channel {channel_id}.")
+                                    self.bot.add_view(view, message_id=message_id)
+                                    print(f"[Leave] Reattached approval view for message {message_id} in channel {channel_id}.")
                                 except (IndexError, ValueError) as e:
                                     print(f"[Leave] Footer parse error in channel {channel_id}: {e}")
 
@@ -605,7 +728,7 @@ class LeaveCog(commands.Cog, name="Leave"):
     async def export_leave(self, ctx):
         """Exports current month's leave details to an Excel file."""
         try:
-            export_directory = "/home/am.k/Concord/Database/Leave details"
+            export_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Database', 'Leave details'))
             os.makedirs(export_directory, exist_ok=True)
             current_date = datetime.now().strftime("%d-%m-%Y")
             export_path = os.path.join(export_directory, f"leave_details_export_{current_date}.xlsx")

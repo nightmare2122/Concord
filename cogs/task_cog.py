@@ -229,8 +229,17 @@ class TaskCog(commands.Cog, name="Tasks"):
             start_view.add_item(start_button)
             await temp_channel.send("Welcome to task assignment! Click below to enter assignees.", view=start_view)
 
+        except discord.NotFound as e:
+            logging.warning(f"[Task] Interaction expired or not found: {e}")
         except Exception as e:
-            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+            logging.error(f"[Task] handle_assign_task error: {e}")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"An error occurred: {e}", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+            except Exception:
+                pass
 
     # -------------------------------------------------------------------------
     # View Tasks flow
@@ -293,8 +302,17 @@ class TaskCog(commands.Cog, name="Tasks"):
             if not new_tasks_found:
                 await interaction.followup.send("No new tasks found.", ephemeral=True)
 
+        except discord.NotFound as e:
+            logging.warning(f"[Task] Interaction expired or not found: {e}")
         except Exception as e:
-            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+            logging.error(f"[Task] handle_view_tasks_button error: {e}")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"An error occurred: {e}", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+            except Exception:
+                pass
 
     # -------------------------------------------------------------------------
     # Button builders
@@ -331,8 +349,16 @@ class TaskCog(commands.Cog, name="Tasks"):
                     task["assignee_ids"] = [i.guild.get_member_named(n).id for n in task["assignees"]]
                     task["status"] = "Pending"
                     await self.deadline_modification_prompt(temp_channel, task, task["assigner_id"], task["assignee_ids"])
+            except discord.NotFound as e:
+                logging.warning(f"[Task] Interaction expired or not found: {e}")
             except Exception as e:
-                await i.followup.send(f"An error occurred: {e}", ephemeral=True)
+                try:
+                    if not i.response.is_done():
+                        await i.response.send_message(f"An error occurred: {e}", ephemeral=True)
+                    else:
+                        await i.followup.send(f"An error occurred: {e}", ephemeral=True)
+                except Exception:
+                    pass
         modify_button.callback = modify_cb
         view.add_item(modify_button)
 
@@ -345,8 +371,16 @@ class TaskCog(commands.Cog, name="Tasks"):
                 await i.followup.send("Task marked as complete. The assigner will be notified.", ephemeral=True)
                 assigner_id = i.guild.get_member_named(task["assigner"]).id
                 await self.update_assigner_view(task, assigner_id, i)
+            except discord.NotFound as e:
+                logging.warning(f"[Task] Interaction expired or not found: {e}")
             except Exception as e:
-                await i.followup.send(f"An error occurred: {e}", ephemeral=True)
+                try:
+                    if not i.response.is_done():
+                        await i.response.send_message(f"An error occurred: {e}", ephemeral=True)
+                    else:
+                        await i.followup.send(f"An error occurred: {e}", ephemeral=True)
+                except Exception:
+                    pass
         mark_complete_button.callback = mark_complete_cb
         view.add_item(mark_complete_button)
 
@@ -397,8 +431,16 @@ class TaskCog(commands.Cog, name="Tasks"):
                                     await m.delete()
                                 except discord.NotFound:
                                     pass
+            except discord.NotFound as e:
+                logging.warning(f"[Task] Interaction expired or not found: {e}")
             except Exception as e:
-                await i.followup.send(f"An error occurred: {e}", ephemeral=True)
+                try:
+                    if not i.response.is_done():
+                        await i.response.send_message(f"An error occurred: {e}", ephemeral=True)
+                    else:
+                        await i.followup.send(f"An error occurred: {e}", ephemeral=True)
+                except Exception:
+                    pass
 
         complete_button.callback = complete_cb
         view.add_item(link_button)
@@ -413,8 +455,16 @@ class TaskCog(commands.Cog, name="Tasks"):
                     if m:
                         await m.send(f"Pending task: {task['details']}\nDeadline: {task['deadline']}\nChannel: {task['temp_channel_link']}")
                 await i.followup.send("Assignees reminded.", ephemeral=True)
+            except discord.NotFound as e:
+                logging.warning(f"[Task] Interaction expired or not found: {e}")
             except Exception as e:
-                await i.followup.send(f"An error occurred: {e}", ephemeral=True)
+                try:
+                    if not i.response.is_done():
+                        await i.response.send_message(f"An error occurred: {e}", ephemeral=True)
+                    else:
+                        await i.followup.send(f"An error occurred: {e}", ephemeral=True)
+                except Exception:
+                    pass
         remind_button.callback = remind_cb
         view.add_item(remind_button)
 
@@ -445,8 +495,16 @@ class TaskCog(commands.Cog, name="Tasks"):
                     await i.followup.send("Deadline confirmed by all parties! Task stored.", ephemeral=False)
                 else:
                     await i.followup.send("Confirmed. Waiting for the other party.", ephemeral=True)
+            except discord.NotFound as e:
+                logging.warning(f"[Task] Interaction expired or not found: {e}")
             except Exception as e:
-                await i.followup.send(f"An error occurred: {e}", ephemeral=True)
+                try:
+                    if not i.response.is_done():
+                        await i.response.send_message(f"An error occurred: {e}", ephemeral=True)
+                    else:
+                        await i.followup.send(f"An error occurred: {e}", ephemeral=True)
+                except Exception:
+                    pass
 
         async def modify_cb(i):
             await i.response.send_message("Please enter the new deadline (DD/MM/YYYY HH:MM AM/PM):", ephemeral=True)
@@ -484,8 +542,16 @@ class TaskCog(commands.Cog, name="Tasks"):
                     await i.followup.send("Deadline confirmed and updated!", ephemeral=False)
                 else:
                     await i.followup.send("Confirmed. Waiting for the other party.", ephemeral=True)
+            except discord.NotFound as e:
+                logging.warning(f"[Task] Interaction expired or not found: {e}")
             except Exception as e:
-                await i.followup.send(f"An error occurred: {e}", ephemeral=True)
+                try:
+                    if not i.response.is_done():
+                        await i.response.send_message(f"An error occurred: {e}", ephemeral=True)
+                    else:
+                        await i.followup.send(f"An error occurred: {e}", ephemeral=True)
+                except Exception:
+                    pass
 
         async def modify_cb(i):
             try:
@@ -496,8 +562,16 @@ class TaskCog(commands.Cog, name="Tasks"):
                 confirmed_users.clear()
                 embed.set_field_at(0, name="Proposed Deadline", value=msg.content, inline=False)
                 await channel.send("Deadline modified.", embed=embed, view=view)
+            except discord.NotFound as e:
+                logging.warning(f"[Task] Interaction expired or not found: {e}")
             except Exception as e:
-                await i.followup.send(f"An error occurred: {e}", ephemeral=True)
+                try:
+                    if not i.response.is_done():
+                        await i.response.send_message(f"An error occurred: {e}", ephemeral=True)
+                    else:
+                        await i.followup.send(f"An error occurred: {e}", ephemeral=True)
+                except Exception:
+                    pass
 
         confirm_button.callback = confirm_cb
         modify_button.callback = modify_cb

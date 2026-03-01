@@ -90,14 +90,14 @@ class TaskCog(commands.Cog, name="Tasks"):
                     for item in message.components[0].children
                 )
             ):
-                print("[Task] Command buttons already exist in the command channel.")
+                logging.info("[Task] Command buttons already exist in the command channel.")
                 return
 
         view = ui.View(timeout=None)
         view.add_item(ui.Button(label="Assign Task", style=discord.ButtonStyle.green, custom_id="assign_task_button"))
         view.add_item(ui.Button(label="View Tasks", style=discord.ButtonStyle.primary, custom_id="view_tasks_button"))
         await command_channel.send("Command buttons:", view=view)
-        print("[Task] Created command buttons in command channel.")
+        logging.info("[Task] Created command buttons in command channel.")
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):

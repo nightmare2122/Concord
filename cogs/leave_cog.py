@@ -7,6 +7,7 @@ import sys
 import os
 import re
 import asyncio
+import logging
 import pandas as pd
 from datetime import datetime, timedelta
 
@@ -537,7 +538,7 @@ class LeaveCog(commands.Cog, name="Leave"):
                 view = LeaveApplicationView()
                 await asyncio.sleep(1)
                 await message.edit(view=view)
-                print("[Leave] Reattached view to existing message in submit channel.")
+                logging.info("[Leave] Reattached view to existing message in submit channel.")
                 found_existing = True
                 break
         if not found_existing:
@@ -547,7 +548,7 @@ class LeaveCog(commands.Cog, name="Leave"):
                 embed=discord.Embed(title="Please select your leave type using the buttons given below", color=5810975),
                 view=view,
             )
-            print("[Leave] Created new leave application message in submit channel.")
+            logging.info("[Leave] Created new leave application message in submit channel.")
 
         # Reattach approval channel buttons
         for channel_id in APPROVAL_CHANNELS.values():

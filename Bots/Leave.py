@@ -1,12 +1,16 @@
 
 # Discord bot to submit and manage leave applications
 
+import sys
+import os
+# Ensure db_managers is importable regardless of launch directory
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+
 import discord
 from discord.ext import commands
 from discord.ui import Button, View, Modal, TextInput
 import sqlite3
 import re
-import os
 import pandas as pd
 import time
 import asyncio
@@ -15,9 +19,12 @@ from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import Alignment, Font
 from openpyxl.worksheet.table import Table, TableStyleInfo
+from db_managers import leave_db_manager as db
 
-# Replace with your bot token
-TOKEN = 'MTI4NDM4ODM5MjgzODEwMzEwMQ.Gz3UDQ.TeVOEWv2zQJJz-SP-Mu9njYyYZsPuH50c4KO5o'
+# Bot token loaded from environment variable (never hardcode tokens in source)
+TOKEN = os.getenv('LEAVE_BOT_TOKEN')
+if not TOKEN:
+    raise ValueError("LEAVE_BOT_TOKEN environment variable not set. Add it to your .env or export it in your shell.")
 
 # Channel ID for submitting leave applications
 submit_channel_id = 1281201690904629289
@@ -62,13 +69,9 @@ intents.message_content = True
 client = commands.Bot(command_prefix='!', intents=intents)
 
 # Network path to the NAS server
-nas_server_path = r"Z:\Bot databases\Leave"
+nas_server_path = r"/home/am.k/Concord/Database"
 
 # Initialize SQLite databases on the NAS server
-conn1 = sqlite3.connect(os.path.join(nas_server_path, 'leave_details.db'))
-conn2 = sqlite3.connect(os.path.join(nas_server_path, 'dynamic_updates.db'))
-c1 = conn1.cursor()
-c2 = conn2.cursor()
 
 # Initialize the rate limiter
 rate_limiter = asyncio.Semaphore(1)  # Adjust the number as needed
@@ -78,18 +81,7 @@ async def rate_limited_request(coro):
         await asyncio.sleep(1)  # Add a delay between requests
         return await coro
 
-# Initialize the queue
-db_queue = asyncio.Queue()
-
-async def db_worker():
-    while True:
-        func, args, kwargs, future = await db_queue.get()
-        try:
-            result = func(*args, **kwargs)
-            future.set_result(result)
-        except Exception as e:
-            future.set_exception(e)
-        db_queue.task_done()
+# NOTE: Database queue is managed by leave_db_manager.py
 
 # Function to create a leave application embed
 def create_leave_embed(leave_details, user_id, nickname, current_stage):
@@ -118,65 +110,10 @@ def create_leave_embed(leave_details, user_id, nickname, current_stage):
     embed.set_footer(text=f"Stage: {current_stage} | User ID: {user_id}")
     return embed
 
-# Function to sanitize table names
-def sanitize_table_name(name):
-    sanitized_name = re.sub(r'\W+', '_', name)
-    return sanitized_name
-
-async def db_execute(func, *args, **kwargs):
-    future = asyncio.Future()
-    await db_queue.put((func, args, kwargs, future))
-    return await future
-
-# Function to create a table for a user in the first database
-async def create_user_table(nickname):
-    table_name = sanitize_table_name(nickname)
-    await db_execute(c1.execute, f'''
-        CREATE TABLE IF NOT EXISTS {table_name} (
-            leave_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            leave_type TEXT,
-            leave_reason TEXT,
-            date_from TEXT,
-            date_to TEXT,
-            number_of_days_off REAL,
-            resume_office_on TEXT,
-            time_off TEXT,
-            leave_status TEXT,
-            reason_for_decline TEXT,
-            approved_by TEXT,
-            time_period TEXT,
-            footer_text TEXT
-        )
-    ''')
-    await db_execute(conn1.commit)
-
-# Function to delete a table for a user in the first database
-async def delete_user_table(nickname):
-    table_name = sanitize_table_name(nickname)
-    await db_execute(c1.execute, f'''
-        DROP TABLE IF EXISTS {table_name}
-    ''')
-    await db_execute(conn1.commit)
-
-# Function to create the universal table in the second database
-async def create_dynamic_table():
-    await db_execute(c2.execute, '''
-        CREATE TABLE IF NOT EXISTS dynamic_updates (
-            nickname TEXT,
-            user_id INTEGER UNIQUE,
-            total_sick_leave REAL DEFAULT 0,
-            total_casual_leave REAL DEFAULT 0,
-            total_c_off REAL DEFAULT 0,
-            last_leave_taken TEXT,
-            off_duty_hours REAL DEFAULT 0
-        )
-    ''')
-    await db_execute(conn2.commit)
-
 # Function to export leave details to an Excel file
 async def export_leave_details_to_excel():
     # Specify the directory where you want to save the Excel file
-    export_directory = r"Z:\Bot databases\Leave details"
+    export_directory = "/home/am.k/Concord/Database/Leave details"
     os.makedirs(export_directory, exist_ok=True)  # Create the directory if it doesn't exist
 
     # Generate the file name with the current date
@@ -189,8 +126,7 @@ async def export_leave_details_to_excel():
     end_of_month = end_of_month.strftime("%d-%m-%Y")
 
     # Fetch all tables in the leave_details database, excluding sqlite_sequence
-    tables = await db_execute(c1.execute, "SELECT name FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence';")
-    tables = tables.fetchall()
+    tables = await db.get_all_tables()
 
     # Create a new workbook and remove the default sheet
     wb = Workbook()
@@ -201,12 +137,7 @@ async def export_leave_details_to_excel():
         # Truncate the table name to 31 characters for the sheet name
         sheet_name = table_name[:31]
         # Read the table into a DataFrame, including only accepted and withdrawn leaves within the month
-        query = f"""
-            SELECT * FROM {table_name}
-            WHERE (leave_status = 'Accepted' OR leave_status = 'Withdrawn')
-            AND (date_from >= '{start_of_month}' AND (date_to <= '{end_of_month}' OR date_to IS NULL))
-        """
-        df = pd.read_sql_query(query, conn1)
+        df = await db.fetch_table_data(table_name, start_of_month, end_of_month)
         
         if df.empty:
             continue  # Skip empty tables
@@ -257,85 +188,67 @@ async def export_leave_details_to_excel():
 @client.event
 async def on_ready():
     print(f'Logged in as {client.user}')
+
+    # Start the database worker task FIRST so all subsequent db calls can be processed
+    asyncio.ensure_future(db.db_worker())
+
     guild = client.guilds[0]
     emp_role = guild.get_role(emp_role_id)
-    await create_dynamic_table()  # Await the coroutine
+    await db.create_dynamic_table()
     for member in emp_role.members:
-        await create_user_table(member.display_name)  # Await the coroutine
-        await db_execute(c2.execute, '''
-            INSERT OR IGNORE INTO dynamic_updates (nickname, user_id)
-            VALUES (?, ?)
-        ''', (member.display_name, member.id))
-    await db_execute(conn2.commit)
-    
+        await db.create_user_table(member.display_name)
+        await db.insert_dynamic_user(member.display_name, member.id)
+
     # Reattach view to the command button in the submit channel
-    channel = client.get_channel(submit_channel_id)
-    async for message in channel.history(limit=10):
+    submit_channel = client.get_channel(submit_channel_id)
+    found_existing = False
+    async for message in submit_channel.history(limit=10):
         if message.author == client.user and message.embeds and "Please select your leave type using the buttons given below" in message.embeds[0].title:
             view = LeaveApplicationView()
-            await rate_limited_request(message.edit(view=view))
+            await asyncio.sleep(1)
+            await message.edit(view=view)
             print("Reattached view to existing message in submit channel.")
+            found_existing = True
             break
-    else:
-        # If no existing message is found, create a new one
+    if not found_existing:
         view = LeaveApplicationView()
-        await rate_limited_request(channel.send(embed=discord.Embed(title="Please select your leave type using the buttons given below", color=5810975), view=view))
+        await asyncio.sleep(1)
+        await submit_channel.send(
+            embed=discord.Embed(title="Please select your leave type using the buttons given below", color=5810975),
+            view=view
+        )
+        print("Created new leave application message in submit channel.")
 
     # Reattach views to leave approval embeds in all approval channels
     for channel_id in approval_channels.values():
         channel = client.get_channel(channel_id)
-        async for message in channel.history(limit=50):  # Adjust the limit as needed
+        if channel is None:
+            continue
+        async for message in channel.history(limit=50):
             if message.author == client.user and message.embeds and "Leave Application" in message.embeds[0].title:
-                if not any(button.disabled for button in message.components[0].children):
+                if message.components and not any(button.disabled for button in message.components[0].children):
                     leave_details = extract_leave_details_from_embed(message.embeds[0])
                     footer_text = message.embeds[0].footer.text if message.embeds[0].footer else None
                     if footer_text:
-                        # Extract user_id, current_stage, channel_id, and message_id from footer text
                         parts = footer_text.split(" | ")
                         if len(parts) >= 5:
                             try:
                                 current_stage = parts[0].split(": ")[1]
                                 user_id = int(parts[1].split(": ")[1])
-                                nickname = parts[2].split(": ")[1]  # Extract nickname from footer text
-                                channel_id = int(parts[3].split(": ")[1])  # Extract channel ID from footer text
-                                message_id = int(parts[4].split(": ")[1])  # Extract message ID from footer text
+                                nickname = parts[2].split(": ")[1]
+                                message_id = int(parts[4].split(": ")[1])
                                 view = LeaveApprovalView(user_id, leave_details, current_stage, nickname)
-                                message = await rate_limited_request(channel.fetch_message(message_id))
-                                await rate_limited_request(message.edit(view=view))
+                                await asyncio.sleep(1)
+                                fetched = await channel.fetch_message(message_id)
+                                await fetched.edit(view=view)
                                 print(f"Reattached view to leave approval message in channel {channel_id}.")
                             except (IndexError, ValueError) as e:
                                 print(f"Error parsing footer text in channel {channel_id}: {footer_text} - {e}")
                         else:
-                            print(f"Skipping message in channel {channel_id} due to incorrect footer format: {footer_text}")
+                            print(f"Skipping message in channel {channel_id} due to incorrect footer format.")
                     else:
-                        # Retrieve footer text from the database
-                        await db_execute(c1.execute, f'''
-                            SELECT footer_text FROM {sanitize_table_name(nickname)}
-                            WHERE leave_id = ?
-                        ''', (leave_details['leave_id'],))
-                        db_footer_text = c1.fetchone()
-                        if db_footer_text:
-                            parts = db_footer_text[0].split(" | ")
-                            if len(parts) >= 5:
-                                try:
-                                    current_stage = parts[0].split(": ")[1]
-                                    user_id = int(parts[1].split(": ")[1])
-                                    nickname = parts[2].split(": ")[1]  # Extract nickname from footer text
-                                    channel_id = int(parts[3].split(": ")[1])  # Extract channel ID from footer text
-                                    message_id = int(parts[4].split(": ")[1])  # Extract message ID from footer text
-                                    view = LeaveApprovalView(user_id, leave_details, current_stage, nickname)
-                                    message = await rate_limited_request(channel.fetch_message(message_id))
-                                    await rate_limited_request(message.edit(view=view))
-                                    print(f"Reattached view to leave approval message in channel {channel_id}.")
-                                except (IndexError, ValueError) as e:
-                                    print(f"Error parsing footer text from database in channel {channel_id}: {db_footer_text[0]} - {e}")
-                            else:
-                                print(f"Skipping message in channel {channel_id} due to incorrect footer format in database: {db_footer_text[0]}")
-                        else:
-                            print(f"Skipping message in channel {channel_id} due to missing footer text in database.")
+                        print(f"Skipping message in channel {channel_id}: no footer text found.")
 
-    # Start the database worker task
-    client.loop.create_task(db_worker())
 
 def extract_leave_details_from_embed(embed):
     leave_details = {}
@@ -364,19 +277,11 @@ def extract_leave_details_from_embed(embed):
 @client.event
 async def on_member_update(before, after):
     if emp_role_id in [role.id for role in after.roles] and emp_role_id not in [role.id for role in before.roles]:
-        create_user_table(after.display_name)
-        c2.execute('''
-            INSERT OR IGNORE INTO dynamic_updates (nickname, user_id)
-            VALUES (?, ?)
-        ''', (after.display_name, after.id))
-        conn2.commit()
+        db.create_user_table(after.display_name)
+        await db.insert_dynamic_user(after.display_name, after.id)
     elif emp_role_id not in [role.id for role in after.roles] and emp_role_id in [role.id for role in before.roles]:
-        delete_user_table(after.display_name)
-        c2.execute('''
-            DELETE FROM dynamic_updates
-            WHERE user_id = ?
-        ''', (after.id,))
-        conn2.commit()
+        db.delete_user_table(after.display_name)
+        await db.remove_dynamic_user(after.id)
 
 class LeaveApplicationView(View):
     def __init__(self):
@@ -399,12 +304,7 @@ class LeaveApplicationView(View):
         user_id = interaction.user.id
         
         # Fetch the last accepted leave date, total casual leave, and total sick leave from the dynamic_updates database
-        result = await db_execute(c2.execute, '''
-            SELECT last_leave_taken, total_casual_leave, total_sick_leave
-            FROM dynamic_updates
-            WHERE user_id = ?
-        ''', (user_id,))
-        result = result.fetchone()
+        result = await db.fetch_dynamic_user(user_id)
         
         if result:
             last_leave_taken, total_casual_leave, total_sick_leave = result
@@ -420,6 +320,8 @@ class LeaveApplicationView(View):
         @discord.ui.button(label="Withdraw Leave", style=discord.ButtonStyle.danger, custom_id="FormID5")
         async def withdraw_leave_button(self, interaction: discord.Interaction, button: discord.ui.Button):
             await interaction.response.send_modal(WithdrawLeaveModal())
+
+from db_managers import leave_db_manager as db
 
 class LeaveApprovalView(View):
     def __init__(self, user_id, leave_details, current_stage, nickname):
@@ -444,13 +346,8 @@ class LeaveApprovalView(View):
                 self.leave_details['approved_by'] = interaction.user.display_name
 
                 # Update the database with the approver's name
-                table_name = sanitize_table_name(self.nickname)
-                c1.execute(f'''
-                    UPDATE {table_name}
-                    SET approved_by = ?
-                    WHERE leave_id = ?
-                ''', (interaction.user.display_name, self.leave_details['leave_id']))
-                conn1.commit()
+                table_name = db.sanitize_table_name(self.nickname)
+                await db.update_approval(self.nickname, self.leave_details['leave_id'], interaction.user.display_name)
 
                 # Create the embed without changing the leave applier's name
                 embed = create_leave_embed(self.leave_details, self.user_id, self.nickname, self.current_stage)
@@ -476,12 +373,7 @@ class LeaveApprovalView(View):
                     new_footer_text = f"Stage: second | User ID: {self.user_id} | Nickname: {self.nickname} | Channel ID: {second_approval_channel_id} | Message ID: {message.id}"
                     embed.set_footer(text=new_footer_text)
                     await message.edit(embed=embed)
-                    c1.execute(f'''
-                        UPDATE {table_name}
-                        SET footer_text = ?
-                        WHERE leave_id = ?
-                    ''', (new_footer_text, self.leave_details['leave_id']))
-                    conn1.commit()
+                    await db.update_footer_text(self.nickname, self.leave_details['leave_id'], new_footer_text)
 
                     # Update the original message to show it has been approved
                     await interaction.message.edit(view=None)
@@ -494,46 +386,13 @@ class LeaveApprovalView(View):
 
                 elif self.current_stage == 'second':
                     # Update the leave status in the database
-                    c1.execute(f'''
-                        UPDATE {table_name}
-                        SET leave_status = 'Accepted'
-                        WHERE leave_id = ?
-                    ''', (self.leave_details['leave_id'],))
-                    conn1.commit()
-
-                    # Update the dynamic_updates table
-                    leave_reason = self.leave_details['leave_reason'].lower()
-                    number_of_days_off = self.leave_details['number_of_days_off']
-                    if leave_reason == "sick":
-                        c2.execute(f'''
-                            UPDATE dynamic_updates
-                            SET total_sick_leave = total_sick_leave + ?, last_leave_taken = ?
-                            WHERE user_id = ?
-                        ''', (number_of_days_off, self.leave_details['date_to'], self.user_id))
-                    elif leave_reason == "casual":
-                        c2.execute(f'''
-                            UPDATE dynamic_updates
-                            SET total_casual_leave = total_casual_leave + ?, last_leave_taken = ?
-                            WHERE user_id = ?
-                        ''', (number_of_days_off, self.leave_details['date_to'], self.user_id))
-                    elif leave_reason == "c. off":
-                        c2.execute(f'''
-                            UPDATE dynamic_updates
-                            SET total_c_off = total_c_off + ?, last_leave_taken = ?
-                            WHERE user_id = ?
-                        ''', (number_of_days_off, self.leave_details['date_to'], self.user_id))
-                    conn2.commit()
+                    await db.confirm_leave_acceptance(self.nickname, self.leave_details['leave_id'], self.leave_details['leave_reason'].lower(), self.leave_details['number_of_days_off'], self.leave_details['date_to'], self.user_id)
 
                     # Update the footer text in the database
                     new_footer_text = f"Stage: third | User ID: {self.user_id} | Nickname: {self.nickname} | Channel ID: {approval_channels['pa']} | Message ID: {interaction.message.id}"
                     embed.set_footer(text=new_footer_text)
                     await interaction.message.edit(embed=embed)
-                    c1.execute(f'''
-                        UPDATE {table_name}
-                        SET footer_text = ?
-                        WHERE leave_id = ?
-                    ''', (new_footer_text, self.leave_details['leave_id']))
-                    conn1.commit()
+                    await db.update_footer_text(self.nickname, self.leave_details['leave_id'], new_footer_text)
 
                     # Update the original message to show it has been approved
                     await interaction.message.edit(view=None)
@@ -546,46 +405,13 @@ class LeaveApprovalView(View):
 
                 elif self.current_stage == 'third':
                     # Update the leave status in the database
-                    c1.execute(f'''
-                        UPDATE {table_name}
-                        SET leave_status = 'Accepted'
-                        WHERE leave_id = ?
-                    ''', (self.leave_details['leave_id'],))
-                    conn1.commit()
-
-                    # Update the dynamic_updates table
-                    leave_reason = self.leave_details['leave_reason'].lower()
-                    number_of_days_off = self.leave_details['number_of_days_off']
-                    if leave_reason == "sick":
-                        c2.execute(f'''
-                            UPDATE dynamic_updates
-                            SET total_sick_leave = total_sick_leave + ?, last_leave_taken = ?
-                            WHERE user_id = ?
-                        ''', (number_of_days_off, self.leave_details['date_to'], self.user_id))
-                    elif leave_reason == "casual":
-                        c2.execute(f'''
-                            UPDATE dynamic_updates
-                            SET total_casual_leave = total_casual_leave + ?, last_leave_taken = ?
-                            WHERE user_id = ?
-                        ''', (number_of_days_off, self.leave_details['date_to'], self.user_id))
-                    elif leave_reason == "c. off":
-                        c2.execute(f'''
-                            UPDATE dynamic_updates
-                            SET total_c_off = total_c_off + ?, last_leave_taken = ?
-                            WHERE user_id = ?
-                        ''', (number_of_days_off, self.leave_details['date_to'], self.user_id))
-                    conn2.commit()
+                    await db.confirm_leave_acceptance(self.nickname, self.leave_details['leave_id'], self.leave_details['leave_reason'].lower(), self.leave_details['number_of_days_off'], self.leave_details['date_to'], self.user_id)
 
                     # Update the footer text in the database
                     new_footer_text = f"Stage: final | User ID: {self.user_id} | Nickname: {self.nickname} | Channel ID: {approval_channels['pa']} | Message ID: {interaction.message.id}"
                     embed.set_footer(text=new_footer_text)
                     await interaction.message.edit(embed=embed)
-                    c1.execute(f'''
-                        UPDATE {table_name}
-                        SET footer_text = ?
-                        WHERE leave_id = ?
-                    ''', (new_footer_text, self.leave_details['leave_id']))
-                    conn1.commit()
+                    await db.update_footer_text(self.nickname, self.leave_details['leave_id'], new_footer_text)
 
                     # Update the original message to show it has been approved
                     await interaction.message.edit(view=None)
@@ -679,65 +505,26 @@ class WithdrawLeaveModal(Modal):
             leave_id = int(self.children[0].value.strip())
             user_id = interaction.user.id
             nickname = interaction.user.display_name
-            table_name = sanitize_table_name(nickname)
+            table_name = db.sanitize_table_name(nickname)
             
-            # Check if the leave ID exists and is accepted
-            result = await db_execute(c1.execute, f'''
-                SELECT leave_reason, number_of_days_off FROM {table_name} WHERE leave_id = ? AND leave_status = 'Accepted'
-            ''', (leave_id,))
-            result = result.fetchone()
+            result = await db.get_leave_status(nickname, leave_id)
             
             if result:
                 leave_reason, number_of_days_off = result
-                # Verify that the user requesting the withdrawal is the same as the user who applied for the leave
-                dynamic_result = await db_execute(c2.execute, '''
-                    SELECT user_id FROM dynamic_updates WHERE nickname = ?
-                ''', (nickname,))
-                dynamic_result = dynamic_result.fetchone()
+                dynamic_result = await db.check_leave_owner(nickname)
                 if dynamic_result and dynamic_result[0] != user_id:
                     await interaction.response.send_message("You can only withdraw your own leave applications.", ephemeral=True)
                     return
                 
                 # Withdraw the leave
-                await db_execute(c1.execute, f'''
-                    UPDATE {table_name} SET leave_status = ? WHERE leave_id = ?
-                ''', ("Withdrawn", leave_id))
-                await db_execute(conn1.commit)
+                await db.withdraw_leave(nickname, leave_id)
                 
                 # Update the dynamic_updates table
                 leave_reason = leave_reason.lower()
-                if leave_reason == "sick":
-                    await db_execute(c2.execute, '''
-                        UPDATE dynamic_updates
-                        SET total_sick_leave = total_sick_leave - ?
-                        WHERE user_id = ?
-                    ''', (number_of_days_off, user_id))
-                elif leave_reason == "casual":
-                    await db_execute(c2.execute, '''
-                        UPDATE dynamic_updates
-                        SET total_casual_leave = total_casual_leave - ?
-                        WHERE user_id = ?
-                    ''', (number_of_days_off, user_id))
-                elif leave_reason == "c. off":
-                    await db_execute(c2.execute, '''
-                        UPDATE dynamic_updates
-                        SET total_c_off = total_c_off - ?
-                        WHERE user_id = ?
-                    ''', (number_of_days_off, user_id))
-                await db_execute(conn2.commit)
+                await db.reduce_leave_balance(user_id, leave_reason, number_of_days_off)
 
                 # Update the last_leave_taken field with the latest accepted leave date
-                latest_leave_date = await db_execute(c1.execute, f'''
-                    SELECT MAX(date_to) FROM {table_name} WHERE leave_status = 'Accepted'
-                ''')
-                latest_leave_date = latest_leave_date.fetchone()[0]
-                if latest_leave_date:
-                    await db_execute(c2.execute, '''
-                        UPDATE dynamic_updates
-                        SET last_leave_taken = ?
-                        WHERE user_id = ?
-                    ''', (latest_leave_date, user_id))
-                    await db_execute(conn2.commit)
+                await db.update_last_leave_date_after_withdrawal(nickname, user_id)
 
                 await interaction.response.send_message(f"Leave with ID {leave_id} has been withdrawn.", ephemeral=True)
             else:
@@ -783,13 +570,7 @@ async def send_leave_application_to_approval_channel(interaction, leave_details,
     await message.edit(embed=embed)
 
     # Store the footer text in the database
-    table_name = sanitize_table_name(interaction.user.display_name)
-    await db_execute(c1.execute, f'''
-        UPDATE {table_name}
-        SET footer_text = ?
-        WHERE leave_id = ?
-    ''', (footer_text, leave_details['leave_id']))
-    await db_execute(conn1.commit)
+    await db.update_footer_text(interaction.user.display_name, leave_details['leave_id'], footer_text)
 
 class FullDayLeaveModal(Modal):
     def __init__(self):
@@ -803,7 +584,7 @@ class FullDayLeaveModal(Modal):
         try:
             user_id = interaction.user.id
             nickname = interaction.user.display_name
-            table_name = sanitize_table_name(nickname)
+            table_name = db.sanitize_table_name(nickname)
             
             # Convert inputs to uppercase
             leave_reason = self.children[0].value.strip().upper()
@@ -862,23 +643,8 @@ class FullDayLeaveModal(Modal):
                 None  # reason_for_decline is None initially
             )
 
-            # Retry mechanism for database operations
-            retries = 5
-            for attempt in range(retries):
-                try:
-                    c1.execute(f'''
-                        INSERT INTO {table_name} (leave_type, leave_reason, date_from, date_to, number_of_days_off, resume_office_on, time_off, leave_status, reason_for_decline)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', data)
-                    conn1.commit()
-                    break
-                except sqlite3.OperationalError as e:
-                    if "database is locked" in str(e) and attempt < retries - 1:
-                        time.sleep(1)  # Wait for 1 second before retrying
-                    else:
-                        raise
-
-            leave_id = c1.lastrowid
+            # Retry mechanism for database operations handled by db queue
+            leave_id = await db.submit_leave_application(nickname, leave_details, data)
             leave_details['leave_id'] = leave_id  # Include leave_id in leave_details
 
             await send_leave_application_to_approval_channel(interaction, leave_details, [role.id for role in interaction.user.roles])
@@ -900,7 +666,7 @@ class HalfDayLeaveModal(Modal):
         try:
             user_id = interaction.user.id
             nickname = interaction.user.display_name
-            table_name = sanitize_table_name(nickname)
+            table_name = db.sanitize_table_name(nickname)
             
             # Convert inputs to uppercase
             leave_reason = self.children[0].value.strip().upper()
@@ -945,23 +711,8 @@ class HalfDayLeaveModal(Modal):
                 None  # reason_for_decline is None initially
             )
 
-            # Retry mechanism for database operations
-            retries = 5
-            for attempt in range(retries):
-                try:
-                    c1.execute(f'''
-                        INSERT INTO {table_name} (leave_type, leave_reason, date_from, date_to, number_of_days_off, resume_office_on, time_period, leave_status, reason_for_decline)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', data)
-                    conn1.commit()
-                    break
-                except sqlite3.OperationalError as e:
-                    if "database is locked" in str(e) and attempt < retries - 1:
-                        time.sleep(1)  # Wait for 1 second before retrying
-                    else:
-                        raise
-
-            leave_id = c1.lastrowid
+            # Retry mechanism for database operations handled by db queue
+            leave_id = await db.submit_leave_application(nickname, leave_details, data)
             leave_details['leave_id'] = leave_id  # Include leave_id in leave_details
 
             await send_leave_application_to_approval_channel(interaction, leave_details, [role.id for role in interaction.user.roles])
@@ -984,7 +735,7 @@ class OffDutyLeaveModal(Modal):
         try:
             user_id = interaction.user.id
             nickname = interaction.user.display_name
-            table_name = sanitize_table_name(nickname)
+            table_name = db.sanitize_table_name(nickname)
             
             # Convert inputs to uppercase
             leave_reason = self.children[0].value.strip().upper()
@@ -1038,32 +789,12 @@ class OffDutyLeaveModal(Modal):
                 None  # reason_for_decline is None initially
             )
 
-            # Retry mechanism for database operations
-            retries = 5
-            for attempt in range(retries):
-                try:
-                    c1.execute(f'''
-                        INSERT INTO {table_name} (leave_type, leave_reason, date_from, date_to, number_of_days_off, resume_office_on, time_period, time_off, leave_status, reason_for_decline)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', data)
-                    conn1.commit()
-                    break
-                except sqlite3.OperationalError as e:
-                    if "database is locked" in str(e) and attempt < retries - 1:
-                        time.sleep(1)  # Wait for 1 second before retrying
-                    else:
-                        raise
-
-            leave_id = c1.lastrowid
+            # Retry mechanism for database operations handled by db queue
+            leave_id = await db.submit_leave_application(nickname, leave_details, data)
             leave_details['leave_id'] = leave_id  # Include leave_id in leave_details
 
             # Update the off_duty_hours in the dynamic_updates table
-            c2.execute('''
-                UPDATE dynamic_updates
-                SET off_duty_hours = off_duty_hours + ?
-                WHERE user_id = ?
-            ''', (cumulated_hours, user_id))
-            conn2.commit()
+            await db.add_off_duty_hours(user_id, cumulated_hours)
 
             await send_leave_application_to_approval_channel(interaction, leave_details, [role.id for role in interaction.user.roles])
             await interaction.response.send_message(f"YOUR OFF DUTY APPLICATION HAS BEEN SUBMITTED. LEAVE ID: {leave_id}", ephemeral=True)
@@ -1078,7 +809,7 @@ class OffDutyLeaveModal(Modal):
 async def export_leave(ctx):
     try:
         # Specify the directory where you want to save the Excel file   
-        export_directory = r"Z:\Bot databases\Leave details"
+        export_directory = "/home/am.k/Concord/Database/Leave details"
         os.makedirs(export_directory, exist_ok=True)  # Create the directory if it doesn't exist
 
         # Generate the file name with the current date
@@ -1091,8 +822,7 @@ async def export_leave(ctx):
         end_of_month = end_of_month.strftime("%d-%m-%Y")
 
         # Fetch all tables in the leave_details database, excluding sqlite_sequence
-        c1.execute("SELECT name FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence';")
-        tables = c1.fetchall()
+        tables = await db.get_all_tables()
 
         # Create a new workbook and remove the default sheet
         wb = Workbook()
@@ -1103,12 +833,7 @@ async def export_leave(ctx):
             # Truncate the table name to 31 characters for the sheet name
             sheet_name = table_name[:31]
             # Read the table into a DataFrame, including only accepted and withdrawn leaves within the month
-            query = f"""
-                SELECT * FROM {table_name}
-                WHERE (leave_status = 'Accepted' OR leave_status = 'Withdrawn')
-                AND (date_from >= '{start_of_month}' AND (date_to <= '{end_of_month}' OR date_to IS NULL))
-            """
-            df = pd.read_sql_query(query, conn1)
+            df = await db.fetch_table_data(table_name, start_of_month, end_of_month)
             
             if df.empty:
                 continue  # Skip empty tables
@@ -1157,4 +882,5 @@ async def export_leave(ctx):
     except Exception as e:
         await ctx.send(f"An error occurred while exporting leave details: {str(e)}")
 
-client.run(TOKEN)
+if __name__ == '__main__':
+    client.run(TOKEN)

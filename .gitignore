@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Databases (runtime data - not source code)
+Database/
+*.db
+*.db-shm
+*.db-wal
+
+# IDE / Editor
+.vscode/
+.pyre_configuration
+.pyre/
+
+# Logs & temp
+*.log
+git_status.txt
+
+# Test artifacts (keep test source, not compiled cache)
+tests/__pycache__/
+Bots/__pycache__/
+Bots/db_managers/__pycache__/

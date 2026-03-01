@@ -65,200 +65,7 @@ departments = {
             "Interns": 1281195640109400085
         }
 
-# Function to check and create the database file
-def check_and_create_database():
-    if not os.path.exists(db_path):
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS tasks (
-                task_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id INTEGER,
-                assignees TEXT,
-                details TEXT,
-                deadline TEXT,
-                temp_channel_link TEXT,
-                assigner TEXT,
-                status TEXT,
-                title TEXT
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS pending_tasks_channels (
-                user_id INTEGER PRIMARY KEY,
-                channel_id INTEGER,
-                tasks TEXT,
-                task_message_ids TEXT
-            )
-        ''')
-        conn.commit()
-        conn.close()
-    else:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        # Check if the 'tasks' and 'task_message_ids' columns exist
-        cursor.execute("PRAGMA table_info(pending_tasks_channels)")
-        columns = [column[1] for column in cursor.fetchall()]
-        if 'tasks' not in columns:
-            cursor.execute('''
-                ALTER TABLE pending_tasks_channels ADD COLUMN tasks TEXT
-            ''')
-        if 'task_message_ids' not in columns:
-            cursor.execute('''
-                ALTER TABLE pending_tasks_channels ADD COLUMN task_message_ids TEXT
-            ''')
-
-        # Check if the 'title' column exists in the 'tasks' table
-        cursor.execute("PRAGMA table_info(tasks)")
-        columns = [column[1] for column in cursor.fetchall()]
-        if 'title' not in columns:
-            cursor.execute('''
-                ALTER TABLE tasks ADD COLUMN title TEXT
-            ''')
-        
-        conn.commit()
-        conn.close()
-
-# Database functions
-async def store_task_in_database(task_data):
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _store_task_in_database_sync, task_data)
-
-async def retrieve_task_from_database(channel_id):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _retrieve_task_from_database_sync, channel_id)
-
-async def update_task_in_database(task_data):
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _update_task_in_database_sync, task_data)
-
-async def retrieve_all_tasks_from_database():
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _retrieve_all_tasks_from_database_sync)
-
-# Define the network path to the NAS
-nas_path = r'Z:\Bot databases\Task'
-db_path = os.path.join(nas_path, 'tasks.db')
-
-def _store_task_in_database_sync(task_data):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS tasks (
-            task_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            channel_id TEXT,
-            assignees TEXT,
-            details TEXT,
-            deadline TEXT,
-            temp_channel_link TEXT,
-            assigner TEXT,
-            status TEXT,
-            title TEXT
-        )
-    ''')
-    cursor.execute('''
-        INSERT INTO tasks (channel_id, assignees, details, deadline, temp_channel_link, assigner, status, title)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (task_data['channel_id'], ', '.join(task_data['assignees']), task_data['details'], task_data['deadline'], task_data['temp_channel_link'], task_data['assigner'], task_data['status'], task_data['title']))
-    conn.commit()
-    conn.close()
-
-def _retrieve_task_from_database_sync(channel_id):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute('SELECT assignees, details, deadline, temp_channel_link, assigner, status, title FROM tasks WHERE channel_id = ?', (channel_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        return {
-            'channel_id': channel_id,
-            'assignees': row[0].split(', '),
-            'details': row[1],
-            'deadline': row[2],
-            'temp_channel_link': row[3],
-            'assigner': row[4],
-            'status': row[5],
-            'title': row[6]  # Ensure title is included
-        }
-    return None
-
-def _retrieve_all_tasks_from_database_sync():
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute('SELECT task_id, channel_id, assignees, details, deadline, temp_channel_link, assigner, status, title FROM tasks')
-    rows = cursor.fetchall()
-    conn.close()
-    tasks = []
-    for row in rows:
-        tasks.append({
-            'task_id': row[0],
-            'channel_id': row[1],
-            'assignees': row[2].split(', '),
-            'details': row[3],
-            'deadline': row[4],
-            'temp_channel_link': row[5],
-            'assigner': row[6],
-            'status': row[7],
-            'title': row[8]  # Ensure title is included
-        })
-    return tasks
-
-def _update_task_in_database_sync(task_data):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE tasks
-        SET assignees = ?, details = ?, deadline = ?, temp_channel_link = ?, assigner = ?, status = ?, title = ?
-        WHERE channel_id = ?
-    ''', (', '.join(task_data['assignees']), task_data['details'], task_data['deadline'], task_data['temp_channel_link'], task_data['assigner'], task_data['status'], task_data['title'], task_data['channel_id']))
-    conn.commit()
-    conn.close()
-
-def _delete_task_from_database_sync(channel_id):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM tasks WHERE channel_id = ?', (channel_id,))
-    conn.commit()
-    conn.close()
-
-def store_pending_tasks_channel(user_id, channel_id, tasks=None, task_message_ids=None):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR REPLACE INTO pending_tasks_channels (user_id, channel_id, tasks, task_message_ids)
-        VALUES (?, ?, ?, ?)
-    ''', (user_id, channel_id, ','.join(tasks) if tasks else '', ','.join(task_message_ids) if task_message_ids else ''))
-    conn.commit()
-    conn.close()
-
-def update_pending_tasks_channel(user_id, tasks, task_message_ids):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE pending_tasks_channels
-        SET tasks = ?, task_message_ids = ?
-        WHERE user_id = ?
-    ''', (','.join(tasks), ','.join(task_message_ids), user_id))
-    conn.commit()
-    conn.close()
-
-def retrieve_pending_tasks_channel(user_id):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute('SELECT channel_id, tasks, task_message_ids FROM pending_tasks_channels WHERE user_id = ?', (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        return row[0], row[1].split(',') if row[1] else [], row[2].split(',') if row[2] else []
-    return None, [], []
-
-def _delete_pending_tasks_channel_from_database(user_id):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM pending_tasks_channels WHERE user_id = ?', (user_id,))
-    conn.commit()
-    conn.close()
+from db_managers.task_db_manager import check_and_create_database, store_task_in_database, retrieve_task_from_database, update_task_in_database, retrieve_all_tasks_from_database, _store_task_in_database_sync, _retrieve_task_from_database_sync, _update_task_in_database_sync, _retrieve_all_tasks_from_database_sync, _delete_task_from_database_sync, store_pending_tasks_channel, update_pending_tasks_channel, retrieve_pending_tasks_channel, _delete_pending_tasks_channel_from_database, db_path
 
 # Event handlers
 
@@ -321,6 +128,7 @@ async def on_interaction(interaction):
 
 async def handle_assign_task(interaction):
     try:
+        await interaction.response.defer(ephemeral=True)
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
             interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True)
@@ -335,7 +143,7 @@ async def handle_assign_task(interaction):
 
         temp_channel_url = temp_channel.jump_url
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Task assignment process started. Please check the new channel: [Click here]({temp_channel_url})", 
             ephemeral=True
         )
@@ -359,13 +167,37 @@ async def handle_assign_task(interaction):
         # Start monitoring the task assignment channel for inactivity
         bot.loop.create_task(monitor_task_assignment_channel(task_data, temp_channel, interaction))
 
-        async def prompt_assignees():
-            while True:
-                await temp_channel.send("Enter the assignee names (separated by commas):")
-                assignee_names_msg = await bot.wait_for('message', check=lambda m: m.author == interaction.user and m.channel == temp_channel)
-                assignee_names = assignee_names_msg.content.split(',')
+        class TaskDetailsModal(ui.Modal, title="Enter Task Details"):
+            task_title = ui.TextInput(label="Task Title", style=discord.TextStyle.short, placeholder="Enter a concise title", required=True)
+            task_details = ui.TextInput(label="Task Description", style=discord.TextStyle.long, placeholder="Detailed task explanation", required=True)
+            task_deadline = ui.TextInput(label="Deadline", style=discord.TextStyle.short, placeholder="DD/MM/YYYY HH:MM AM/PM", required=True)
 
+            async def on_submit(self, modal_interaction: discord.Interaction):
+                await modal_interaction.response.defer()
+                task_data['title'] = self.task_title.value
+                task_data['details'] = self.task_details.value
+                task_data['deadline'] = self.task_deadline.value
+
+                await temp_channel.edit(name=f"task-{self.task_title.value.replace(' ', '-')}")
+
+                for assignee_id in assignee_ids:
+                    assignee = interaction.guild.get_member(int(assignee_id))
+                    if assignee:
+                        await temp_channel.set_permissions(assignee, read_messages=True, send_messages=True)
+
+                task_data['assignees'] = [interaction.guild.get_member(int(assignee_id)).display_name for assignee_id in assignee_ids]
+
+                await prompt_deadline_confirmation(temp_channel, task_data, interaction.user.id, assignee_ids)
+
+        class AssigneeModal(ui.Modal, title="Select Assignees"):
+            assignees_input = ui.TextInput(label="Assignee names (comma separated)", style=discord.TextStyle.short, placeholder="E.g., John, Jane", required=True)
+
+            async def on_submit(self, modal_interaction: discord.Interaction):
+                await modal_interaction.response.defer()
+                assignee_names = self.assignees_input.value.split(',')
                 assignees = []
+                assignee_ids.clear()
+                
                 for name in assignee_names:
                     name = name.strip()
                     assignee = find_closest_match(name, emp_role.members)
@@ -374,62 +206,51 @@ async def handle_assign_task(interaction):
                         assignee_ids.append(str(assignee.id))
                     else:
                         await temp_channel.send(f"No match found for '{name}'. Please try again.")
-                        break
-                else:
-                    assignee_names_str = ', '.join([assignee.display_name for assignee in assignees])
-                    await temp_channel.send(f"Selected assignees: {assignee_names_str}")
+                        # Send another button to retry
+                        retry_view = ui.View(timeout=None)
+                        retry_btn = ui.Button(label="Retry Selection", style=discord.ButtonStyle.secondary)
+                        async def retry_cb(m_interaction):
+                            await m_interaction.response.send_modal(AssigneeModal())
+                        retry_btn.callback = retry_cb
+                        retry_view.add_item(retry_btn)
+                        await temp_channel.send("Retry selecting assignees:", view=retry_view)
+                        return
 
-                    view = ui.View(timeout=None)
-                    retry_button = ui.Button(label="Retry Selection", style=discord.ButtonStyle.secondary)
-                    confirm_button = ui.Button(label="Confirm Submission", style=discord.ButtonStyle.success)
+                assignee_names_str = ', '.join([assignee.display_name for assignee in assignees])
+                await temp_channel.send(f"Selected assignees: {assignee_names_str}")
 
-                    async def retry_button_callback(interaction):
-                        await interaction.response.defer()
-                        assignee_ids.clear()
-                        await prompt_assignees()
+                view = ui.View(timeout=None)
+                retry_button = ui.Button(label="Retry Selection", style=discord.ButtonStyle.secondary)
+                confirm_button = ui.Button(label="Confirm Submission", style=discord.ButtonStyle.success)
 
-                    async def confirm_button_callback(interaction):
-                        await interaction.response.defer()
-                        await temp_channel.send("Please provide a concise task title:")
-                        task_title_msg = await bot.wait_for('message', check=lambda m: m.author == interaction.user and m.channel == temp_channel)
-                        task_title = task_title_msg.content
-                        task_data['title'] = task_title  # Update task_data with the task title
+                async def retry_button_callback(btn_interaction):
+                    await btn_interaction.response.send_modal(AssigneeModal())
 
-                        await temp_channel.send("Now, provide the detailed task description:")
-                        task_details_msg = await bot.wait_for('message', check=lambda m: m.author == interaction.user and m.channel == temp_channel)
-                        task_details = task_details_msg.content
-                        task_data['details'] = task_details  # Update task_data with new details
+                async def confirm_button_callback(btn_interaction):
+                    await btn_interaction.response.send_modal(TaskDetailsModal())
 
-                        await temp_channel.send("Enter the due date and time (DD/MM/YYYY HH:MM AM/PM):")
-                        due_date_msg = await bot.wait_for('message', check=lambda m: m.author == interaction.user and m.channel == temp_channel)
-                        due_date = due_date_msg.content
-                        task_data['deadline'] = due_date  # Update task_data with new deadline
+                retry_button.callback = retry_button_callback
+                confirm_button.callback = confirm_button_callback
 
-                        await temp_channel.edit(name=f"task-{task_title.replace(' ', '-')}")
+                view.add_item(retry_button)
+                view.add_item(confirm_button)
+                await temp_channel.send("Confirm the assignees or retry selection:", view=view)
 
-                        for assignee_id in assignee_ids:
-                            assignee = interaction.guild.get_member(int(assignee_id))
-                            await temp_channel.set_permissions(assignee, read_messages=True, send_messages=True)
-
-                        task_data['assignees'] = [interaction.guild.get_member(int(assignee_id)).display_name for assignee_id in assignee_ids]
-
-                        await prompt_deadline_confirmation(temp_channel, task_data, interaction.user.id, assignee_ids)
-
-                    retry_button.callback = retry_button_callback
-                    confirm_button.callback = confirm_button_callback
-
-                    view.add_item(retry_button)
-                    view.add_item(confirm_button)
-                    await temp_channel.send("Confirm the assignees or retry selection:", view=view)
-                    return
-
-        await prompt_assignees()
+        # Initially prompt with a button so they can open a modal since we already deferred the first interaction
+        start_view = ui.View(timeout=None)
+        start_button = ui.Button(label="Enter Assignees", style=discord.ButtonStyle.primary)
+        async def start_button_callback(btn_interaction):
+            await btn_interaction.response.send_modal(AssigneeModal())
+        start_button.callback = start_button_callback
+        start_view.add_item(start_button)
+        await temp_channel.send("Welcome to task assignment! Click below to enter the assignee names.", view=start_view)
 
     except Exception as e:
-        await interaction.response.send_message(f"An error occurred: {e}", ephemeral=True)
+        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 async def handle_view_tasks_button(interaction):
     try:
+        await interaction.response.defer(ephemeral=True)
         user_id = interaction.user.id
         user_nickname = interaction.user.display_name
         category = interaction.guild.get_channel(1299338707605651537)
@@ -438,7 +259,7 @@ async def handle_view_tasks_button(interaction):
         if channel_id:
             existing_channel = bot.get_channel(channel_id)
             if existing_channel:
-                await interaction.response.send_message("Tasks have been refreshed.", ephemeral=True)
+                await interaction.followup.send("Tasks have been refreshed.", ephemeral=True)
             else:
                 # If the channel doesn't exist anymore, remove it from the database
                 _delete_pending_tasks_channel_from_database(user_id)
@@ -451,7 +272,7 @@ async def handle_view_tasks_button(interaction):
             }
             pending_tasks_channel = await interaction.guild.create_text_channel(f"pending-tasks-{user_nickname}", overwrites=overwrites, category=category)
             store_pending_tasks_channel(user_id, pending_tasks_channel.id)
-            await interaction.response.send_message(f"Pending tasks channel created: {pending_tasks_channel.jump_url}", ephemeral=True)
+            await interaction.followup.send(f"Pending tasks channel created: {pending_tasks_channel.jump_url}", ephemeral=True)
         else:
             pending_tasks_channel = bot.get_channel(channel_id)
 
@@ -832,7 +653,7 @@ async def check_and_remove_invalid_tasks():
             task_ids_in_db = {str(task['task_id']) for task in tasks}
 
             # Retrieve all pending tasks channels
-            conn = sqlite3.connect('tasks.db')
+            conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
             cursor.execute('SELECT user_id, tasks, task_message_ids FROM pending_tasks_channels')
             rows = cursor.fetchall()
@@ -873,5 +694,8 @@ async def check_and_remove_invalid_tasks():
 
         await asyncio.sleep(60)  # Check every 60 seconds
 
-# Run the bot
-bot.run('MTI4NjMzMjU0ODg4NDA3MDQ3Mg.GkSxMK.-nkt8AJaxX-nwhQn4yGxvWo_qZPcR3UB0Xfn5A')
+if __name__ == '__main__':
+    token = os.getenv('TASK_BOT_TOKEN')
+    if not token:
+        raise ValueError("TASK_BOT_TOKEN environment variable not set. Add it to your .env or export it in your shell.")
+    bot.run(token)

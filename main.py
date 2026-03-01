@@ -1,6 +1,7 @@
 """
 main.py — Unified Concord Bot Entry Point
-A beautiful, unified dashboard for the Concord task, leave, and DAR systems.
+Copyright (c) 2026 Concord Desk. All rights reserved.
+PROPRIETARY AND CONFIDENTIAL.
 """
 
 import os

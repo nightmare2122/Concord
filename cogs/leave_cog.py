@@ -1,6 +1,7 @@
 """
 cogs/leave_cog.py — Leave Management Cog
-Originally Leave.py — migrated to run under the unified Concord bot.
+Copyright (c) 2026 Concord Desk. All rights reserved.
+PROPRIETARY AND CONFIDENTIAL.
 """
 
 import sys

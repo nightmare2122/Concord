@@ -1,6 +1,7 @@
 """
 cogs/dar_cog.py — DAR (Daily Activity Report) Cog
-Originally DAR.py — migrated to run under the unified Concord bot.
+Copyright (c) 2026 Concord Desk. All rights reserved.
+PROPRIETARY AND CONFIDENTIAL.
 """
 
 import asyncio

@@ -1,6 +1,7 @@
 """
 cogs/task_cog.py — Task Management Cog
-Originally Task.py — migrated to run under the unified Concord bot.
+Copyright (c) 2026 Concord Desk. All rights reserved.
+PROPRIETARY AND CONFIDENTIAL.
 """
 
 import asyncio

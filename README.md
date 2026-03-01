@@ -5,7 +5,7 @@
 ![AWS](https://img.shields.io/badge/AWS-Lambda%20%7C%20RDS%20%7C%20EC2-orange)  
 ![Testing](https://img.shields.io/badge/Testing-Pytest%20%7C%20AsyncMock-success)
 ![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub%20Webhooks%20%7C%20CodePipeline-green)  
-![License](https://img.shields.io/badge/license-MIT-lightgrey)  
+![License](https://img.shields.io/badge/license-SaaS%2FSubscription-blueviolet)  
 
 ---
 
@@ -151,8 +151,16 @@ Concord Desk aims to become a **Discord-native CRM system**, integrating:
 
 ---
 
-## 🤝 Contributions  
-Pull requests are welcome! For major changes, please open an issue first to discuss what you’d like to change. 
-When making backend PRs, ensure you execute `pytest tests/ -v` and maintain the isolated dummy-database structure intact.
+## 🔐 Licensing (SaaS / Subscription)  
+Concord Desk is a proprietary workspace automation platform. 
+- **License**: Subscription-based (SaaS). 
+- **Usage**: Unauthorized redistribution or modification is strictly prohibited without a valid subscription agreement.
+- **Support**: Priority support and feature requests are exclusive to active subscribers.
 
 ---
+
+## 🤝 Contributions  
+For authorized developers:
+1. Ensure all backend changes are validated with `pytest tests/ -v`.
+2. Maintain the isolated database testing architecture.
+3. Submit a pull request to the internal `main` branch.

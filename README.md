@@ -1,35 +1,44 @@
-# 🤖 Concord Desk  
-*A lightweight CRM & workflow automation system inside Discord*  
+# 🤖 Concord Unified Engine  
+*Intelligent Architecture for Workspace Automation & Workflow Optimization*  
 
 ![Python](https://img.shields.io/badge/Python-3.14+-blue.svg)  
-![AWS](https://img.shields.io/badge/AWS-Lambda%20%7C%20RDS%20%7C%20EC2-orange)  
-![Testing](https://img.shields.io/badge/Testing-Pytest%20%7C%20AsyncMock-success)
-![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub%20Webhooks%20%7C%20CodePipeline-green)  
+![Architecture](https://img.shields.io/badge/Architecture-Cog--Based-orange)  
+![Discovery](https://img.shields.io/badge/Discovery-Dynamic-success)
+![Database](https://img.shields.io/badge/Database-SQLite%20%7C%20WAL-green)  
 ![License](https://img.shields.io/badge/license-Proprietary-red)  
 
 ---
 
 ## 📌 Overview  
-**Concord Desk** is a highly modular suite of custom **Discord bots** designed as a mini-CRM for office workflows.  
-The system automates **task management, leave tracking, and reporting** while ensuring seamless updates through a custom **CI/CD pipeline** backed by strictly isolated database testing architecture.  
+**Concord Unified Engine** is a modular suite of automation tools designed to manage office workflows directly within Discord.  
 
-The project is now evolving into a **cloud-native architecture** with **AWS Lambda, RDS, and CloudWatch**, combining automation with scalability and reliability.  
+By consolidating multiple specialized services into a single, high-performance bot architecture, Concord automates **employee leave tracking**, **task management**, and **Daily Activity Reporting (DAR)** with near-zero friction.  
 
 ---
 
-## ⚙️ Bots & Architecture  
-The project has been unified into a single application using **Discord.py Cogs**:
-- **Entry Point**: `main.py`
-- **Cogs (`/cogs/`)**:
-  - `task_cog.py` → Task assignment & tracking
-  - `leave_cog.py` → Employee leave management
-  - `dar_cog.py` → Daily Activity Reporting
-- **Shared Token**: Uses a single `BOT_TOKEN` for all features.
+## ⚙️ Core Architecture  
+The project is built on a **Unified Cog System** using **discord.py**:
+
+### 🧠 System Modules (`/cogs/`)
+| Module | Function |
+|---|---|
+| `discovery_cog.py` | **Dynamic Discovery**: Real-time mirroring of Discord server structure to local DB. |
+| `leave_cog.py` | **Leave Pipeline**: 2-stage approval workflow (HOD → HR) with persistent DM status tracking. |
+| `task_cog.py` | **Task Management**: Assignment, prioritization, and lifecycle tracking. |
+| `dar_cog.py` | **Compliance Enforcement**: DAR submission tracking, role-based reset (11:00 AM), and automated reminders. |
+
+---
+
+## 🛰️ The Discovery System  
+Concord features a **Self-Healing Configuration** model. It eliminates hardcoded Discord IDs by maintaining a live mirror of categories, channels, roles, and members in `Database/discovery.db`.  
+
+- **Runtime ID Resolution**: Channel renames or role adjustments in Discord are detected instantly.
+- **Dynamic Config**: Modules like `leave_cog` resolve their operational channels (e.g., `leave-hr`, `leave-pa`) from the database at startup.
 
 ---
 
 ## 🚀 Quick Start (Linux)
-To set up the environment, install dependencies, and start the bot with a single command:
+To set up the environment, install dependencies, and start the engine with a single command:
 
 1. **Configure Environment**:
    ```bash
@@ -37,122 +46,36 @@ To set up the environment, install dependencies, and start the bot with a single
    # Edit .env and add your BOT_TOKEN
    ```
 
-2. **Run the Script**:
+2. **Launch the Engine**:
    ```bash
+   chmod +x run.sh
    ./run.sh
    ```
-*This script will automatically create a virtual environment, install requirements, and launch the bot.*
+*The script automatically manages virtual environment activation and dependency synchronization.*
 
 ---
 
-### 🏗️ Architecture & Database Modularity
-To ensure 100% uptime and prevent "Database is locked" concurrency errors during peak Discord usage, the application enforces a strict **Controller-Service Model**:
-- All raw SQLite queries and database connection handlers have been abstracted out of the Discord UI layer into robust managers: **`db_manager.py`** and **`leave_db_manager.py`**.
-- These managers utilize `PRAGMA journal_mode=WAL;` and explicitly isolated `with get_db_conn() as conn:` context handlers to guarantee thread-safe reading and writing during asynchronous UI interactions.
-- Timeouts and queue loops automatically manage high-volume events (like multiple employees submitting a leave simultaneously).
+## 📚 Documentation
+For a deep dive into every specific module, database schema, and implementation history, please refer to the **[Manual/](./Manual/README.md)** folder:
+
+- **[01 Architecture Overview](./Manual/01_architecture.md)**: Startup sequences and directory structure.
+- **[02 Discovery Deep-Dive](./Manual/02_discovery.md)**: How the dynamic server mirror works.
+- **[03 Leave System](./Manual/03_leave.md)**: Details of the approval and cancellation logic.
+- **[06 Database Reference](./Manual/06_databases.md)**: Every table, schema, and API function.
+- **[WALKTHROUGH.md](./Manual/WALKTHROUGH.md)**: A chronological log of every feature implementation.
 
 ---
 
-## 🧪 Testing & Reliability Framework
-Concord Desk ships with a comprehensive Continuous Integration testing suite (`/tests/`) built on `pytest` and `pytest-asyncio`. The testing architecture guarantees that no regression bugs are pushed to production.
-
-#### 1. Database Isolation Testing
-All tests execute against explicitly patched, auto-generated `:memory:` or temporary disk databases.
-- `test_db.py` and `test_leave_db.py` inject temporary environments into the data layer and run purely synchronous evaluations of the queue mathematics (e.g., ensuring `total_sick_leave` is accurately decremented).
-
-#### 2. Async UI Mocking
-Because standard Discord bot `client.run()` invocations indefinitely block unit-test runners, the application utilizes `unittest.mock.AsyncMock`.
-- `test_bot.py` and `test_leave_bot.py` comprehensively simulate Discord interactions, User Modals, and Button payloads to verify expected Bot Followups and Ephemeral responses—without ever requiring a live internet connection or risking a timeout.
-
----
-
-## 🚀 Features  
-- Developed with **Python 3.14** within heavily optimized `.venv` virtual environments.
-- **Strict Linting**: Configured with explicit `.pyre_configuration` and VSCode Workspace settings to ensure clean IDE resolution.
-- **SQLite databases** acting as resilient caching layers (migration to **AWS RDS** in progress).
-- **Automated deployment pipeline**:  
-  - GitHub → Webhook (Flask + ngrok) → Host PC  
-  - Auto-pulls code on commit  
-  - Restarts bots with near-zero downtime  
-- **NAS integration** for on-site secure centralized storage & remote dynamic table access (`/Database/`).
-- **Cloud-native migration** utilizing AWS services.
-
----
-
-## 🌩️ Cloud Migration (Ongoing)  
-The project is transitioning into AWS for scalability:  
-
-- **AWS Lambda** → Serverless execution of bots  
-- **AWS RDS** → Persistent relational data storage  
-- **AWS IAM** → Fine-grained security & access control  
-- **AWS CloudWatch** → Monitoring, metrics & logs  
-- **AWS EC2** → Compute resources for extended use cases  
-- **AWS S3** → Storage for backups/logs  
-- **AWS CodePipeline** → CI/CD for continuous integration & deployment  
-- **Terraform (IaC)** → Automated infrastructure provisioning  
-
----
-
-## 🛠️ Tech Stack  
-- **Languages**: Python 3, SQL  
-- **Libraries**: Boto3, Flask, Discord.py, Pytest, Pytest-Asyncio 
-- **Databases**: SQLite (local with Write-Ahead Logging), AWS RDS (cloud)  
-- **CI/CD**: GitHub Webhooks, ngrok (migration to AWS CodePipeline planned)  
-- **Cloud & IaC**: AWS Lambda, RDS, IAM, EC2, CloudWatch, Terraform  
-- **Storage**: Unix Local NAS `/home/am.k/Concord/Database/`, AWS S3  
-
----
-
-## 🔄 Workflow  
-1. Developer edits logic locally and verifies logic executing `pytest tests/ -v`.
-2. Developer pushes changes to the **`main` branch** on GitHub.
-3. **Webhook (Flask + ngrok)** notifies the host server.
-4. Host server:  
-   - Pulls the latest code.
-   - Restarts bots automatically.  
-5. (Planned) Migration to **AWS CodePipeline + Lambda** for full automation.  
-
----
-
-## 📈 Skills & Concepts  
-- Python **scripting & automation**  
-- Building **CI/CD pipelines** (GitHub → Host → AWS)  
-- **Database design & management** (SQLite → RDS)
-- **Asynchronous Unit Testing (Pytest-Asyncio)**
-- **Infrastructure as Code (Terraform)**  
-- **Monitoring & reliability** (CloudWatch, restart scripts)  
-- **DevOps practices** (Git, containerization, system automation)  
-- **Cloud migration strategy**  
-
----
-
-## 📚 Roadmap  
-- [x] Build Python bots with databases  
-- [x] Implement GitHub webhook + Flask CI/CD  
-- [x] Automate deployment & restarts
-- [x] Abstract all databases into isolated modular Service layers (`db_manager.py`).
-- [x] Build synchronous and AsyncMock `pytest` validation suites.
-- [x] **Unify bots into a single Cog-based application (`main.py`)**
-- [ ] Migrate databases to **AWS RDS**  
-- [ ] Deploy bots on **AWS Lambda**  
-- [ ] Replace ngrok with **AWS CodePipeline**  
-- [ ] Add **monitoring & alerting** with CloudWatch  
-- [ ] Containerize with **Docker** & explore **ECS/EKS**  
-
----
-
-## 🧩 Future Vision  
-Concord Desk aims to become a **Discord-native CRM system**, integrating:  
-- Task management  
-- Leave approvals  
-- Automated reporting  
-- Cloud-native scalability (AWS)  
-- Zero-downtime continuous deployment  
+## 🏗️ Technical Standards
+- **Asynchronous Data Layer**: All SQLite writes are serialized through a background worker queue (`db_execute`) to prevent concurrency locks.
+- **Persistence**: Leave views (buttons/modals) are reconstructed with metadata from database footers to survive bot restarts.
+- **UX Polish**: Consistent 10-second auto-deletion for ephemeral messages to keep Discord channels clean.
+- **CI/CD Ready**: Integrated with a Flask-based webhook listener for zero-downtime deployment.
 
 ---
 
 ## 🤝 Contributions  
-This project is **private** and proprietary. Contributions are restricted to authorized personnel only. Please contact the project owner before making any changes.
+This project is **private and proprietary**. Access and modification are restricted to authorized personnel.  
 
 ---
 

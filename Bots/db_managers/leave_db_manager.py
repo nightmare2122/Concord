@@ -154,6 +154,20 @@ async def withdraw_leave(nickname, leave_id):
             conn.execute(f"UPDATE {table_name} SET leave_status = 'Withdrawn' WHERE leave_id = ?", (leave_id,))
     await db_execute(_withdraw)
 
+async def request_withdraw_leave(nickname, leave_id):
+    def _request_withdraw():
+        table_name = sanitize_table_name(nickname)
+        with get_leave_conn() as conn:
+            conn.execute(f"UPDATE {table_name} SET leave_status = 'Withdrawal Requested' WHERE leave_id = ?", (leave_id,))
+    await db_execute(_request_withdraw)
+
+async def confirm_withdraw_leave(nickname, leave_id):
+    def _confirm_withdraw():
+        table_name = sanitize_table_name(nickname)
+        with get_leave_conn() as conn:
+            conn.execute(f"UPDATE {table_name} SET leave_status = 'Withdrawn by HR' WHERE leave_id = ?", (leave_id,))
+    await db_execute(_confirm_withdraw)
+
 async def reduce_leave_balance(user_id, leave_reason, amount):
     def _reduce():
         with get_dynamic_conn() as conn:

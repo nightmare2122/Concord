@@ -129,6 +129,21 @@ async def get_leave_status(nickname, leave_id):
             ''', (leave_id,)).fetchone()
     return await db_execute(_get)
 
+async def get_leave_full_details(nickname, leave_id):
+    """Returns all columns for a leave row regardless of its current status."""
+    def _get():
+        table_name = sanitize_table_name(nickname)
+        with get_leave_conn() as conn:
+            row = conn.execute(
+                f"SELECT * FROM {table_name} WHERE leave_id = ?", (leave_id,)
+            ).fetchone()
+            if row:
+                cols = [d[0] for d in conn.execute(f"SELECT * FROM {table_name} LIMIT 0").description]
+                return dict(zip(cols, row))
+            return None
+    return await db_execute(_get)
+
+
 async def get_pending_leave_status(nickname, leave_id):
     def _get():
         table_name = sanitize_table_name(nickname)
@@ -167,6 +182,15 @@ async def confirm_withdraw_leave(nickname, leave_id):
         with get_leave_conn() as conn:
             conn.execute(f"UPDATE {table_name} SET leave_status = 'Withdrawn by HR' WHERE leave_id = ?", (leave_id,))
     await db_execute(_confirm_withdraw)
+
+async def revert_cancellation_request(nickname, leave_id):
+    """Reverts a 'Withdrawal Requested' status back to 'Accepted' when HR rejects the cancellation."""
+    def _revert():
+        table_name = sanitize_table_name(nickname)
+        with get_leave_conn() as conn:
+            conn.execute(f"UPDATE {table_name} SET leave_status = 'Accepted' WHERE leave_id = ?", (leave_id,))
+    await db_execute(_revert)
+
 
 async def reduce_leave_balance(user_id, leave_reason, amount):
     def _reduce():

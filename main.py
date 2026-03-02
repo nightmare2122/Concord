@@ -57,7 +57,7 @@ class ConcordBot(commands.Bot):
         ) as progress:
             progress.add_task(description="[cyan]Initializing Discord components...", total=None)
             
-            cogs = ["cogs.task_cog", "cogs.leave_cog", "cogs.dar_cog"]
+            cogs = ["cogs.task_cog", "cogs.leave_cog", "cogs.dar_cog", "cogs.discovery_cog"]
             for cog in cogs:
                 try:
                     await self.load_extension(cog)

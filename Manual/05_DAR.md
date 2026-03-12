@@ -3,10 +3,12 @@
 ## Purpose
 
 The DAR cog automates enforcement of daily activity reporting:
-- Detects DAR submissions (embed posted in the DAR channel) and assigns a role
-- Removes the role each day at 11:00 AM (reset)
-- Sends DM reminders to members who haven't submitted during evening hours
-- Logs daily DAR compliance to flat files
+- Auto-deploys a persistent "Submit DAR" button interface into the `#daily-activity-report` channel on boot.
+- Submissions are taken via an interactive Discord Modal and neatly formatted into `#dar-reports`.
+- Assigns a `DAR Submitted` tracker role upon successful form submission.
+- Removes the role each day at 11:00 AM (reset).
+- Sends DM reminders to members who haven't submitted during evening hours.
+- Logs daily DAR compliance to flat files.
 
 **File:** `cogs/dar_cog.py`
 
@@ -47,17 +49,23 @@ Runs every 60 seconds after `bot.wait_until_ready()`. Checks the current time:
 
 ---
 
-## DAR Detection — `on_message`
+## DAR UI Setup — `ensure_dar_ui`
 
-Fires for every message in the server.
+Instead of relying on an administrator to run a `!setup_dar` command, the Cog now configures itself. During `cog_load`, an asynchronous `ensure_dar_ui()` function is launched:
+1. Waits 5 seconds for the `discovery_cog` to finish generating the server database.
+2. Resolves the Discord ID for `#daily-activity-report`.
+3. Checks the recent history of the channel.
+4. If the DAR Submission Panel is missing, it dynamically generates an embed and a `DARSetupView` button and posts it to the channel.
 
-1. Filters to only `DAR_CHANNEL_ID`
-2. Checks the message has embeds
-3. Reads `embed.author.name` to identify who posted
-4. Looks up the member by display name with `guild.get_member_named()`
-5. Assigns `DAR_SUBMITTED_ROLE_ID` to the member
+---
 
-> **Assumption:** The embed's `author.name` must exactly match the member's display name.
+## DAR Submission — Modal Interface
+
+When a user clicks "Submit Daily Activity Report", they are served a `DARSubmissionModal`:
+1. **Validation**: Checks if the user already has the `DAR_SUBMITTED_ROLE_ID`. If so, rejects the attempt.
+2. **Data Entry**: Requests "Work Done Today" and optionally "Issues / Blockers".
+3. **Routing**: Assembles a formatted embed and attempts to send it to `#dar-reports`. If `#dar-reports` does not exist, the cog leverages `guild.create_text_channel` to automatically spin it up inside the `Logs` category.
+4. **Role Assignment**: Successfully assigns the tracker role to the user.
 
 ---
 

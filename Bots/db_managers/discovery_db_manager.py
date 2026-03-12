@@ -1,161 +1,205 @@
-import sqlite3
-import os
-import asyncio
+"""
+Bots/db_managers/discovery_db_manager.py — Guild Discovery Database Layer
+Copyright (c) 2026 Concord Desk. All rights reserved.
+PROPRIETARY AND CONFIDENTIAL.
+"""
+
 import logging
 import json
 
-# Path to the Database folder
-db_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'Database'))
-os.makedirs(db_path, exist_ok=True)
-db_discovery_path = os.path.join(db_path, 'discovery.db')
+from .base_db import get_conn, db_queue, db_worker, db_execute  # noqa: F401
 
 logger = logging.getLogger("Concord")
 
-def get_discovery_conn():
-    conn = sqlite3.connect(db_discovery_path, timeout=5.0)
-    conn.execute('PRAGMA journal_mode=WAL;')
-    conn.row_factory = sqlite3.Row
-    return conn
-
-# ─── Database Worker ───────────────────────────────────────────────────────────
-
-db_queue = asyncio.Queue()
-
-async def db_worker():
-    while True:
-        func, args, kwargs, future = await db_queue.get()
-        try:
-            result = func(*args, **kwargs)
-            if not future.done():
-                future.set_result(result)
-        except Exception as e:
-            if not future.done():
-                future.set_exception(e)
-        db_queue.task_done()
-
-async def db_execute(func, *args, **kwargs):
-    future = asyncio.Future()
-    await db_queue.put((func, args, kwargs, future))
-    return await future
-
-# ─── Schema Initialization + Migration ────────────────────────────────────────
+# ─── Schema Initialization + Migration ─────────────────────────────────────────────────────
 
 def _initialize_discovery_db_sync():
-    with get_discovery_conn() as conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS categories (
-                id   INTEGER PRIMARY KEY,
-                name TEXT
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS channels (
-                id          INTEGER PRIMARY KEY,
-                name        TEXT,
-                type        TEXT,
-                category_id INTEGER,
-                FOREIGN KEY (category_id) REFERENCES categories (id)
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS roles (
-                id       INTEGER PRIMARY KEY,
-                name     TEXT,
-                color    TEXT,
-                position INTEGER
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS members (
-                id           INTEGER PRIMARY KEY,
-                name         TEXT,
-                display_name TEXT,
-                joined_at    TEXT,
-                roles        TEXT DEFAULT '[]'
-            )
-        ''')
-
-        # Migration: add roles column if the members table already exists without it
-        try:
-            conn.execute("ALTER TABLE members ADD COLUMN roles TEXT DEFAULT '[]'")
-            logger.info("[Discovery] Migrated members table: added 'roles' column.")
-        except sqlite3.OperationalError:
-            pass  # Column already exists — no action needed
-
-        # Remove the old member_roles junction table if it lingered from a previous version
-        conn.execute('DROP TABLE IF EXISTS member_roles')
-
-# ─── Upsert Sync Functions ────────────────────────────────────────────────────
-
-def _upsert_category_sync(category_id, name):
-    with get_discovery_conn() as conn:
-        conn.execute('INSERT OR REPLACE INTO categories (id, name) VALUES (?, ?)', (category_id, name))
-
-def _upsert_channel_sync(channel_id, name, channel_type, category_id):
-    with get_discovery_conn() as conn:
-        conn.execute(
-            'INSERT OR REPLACE INTO channels (id, name, type, category_id) VALUES (?, ?, ?, ?)',
-            (channel_id, name, channel_type, category_id)
-        )
-
-def _upsert_role_sync(role_id, name, color, position):
-    with get_discovery_conn() as conn:
-        conn.execute(
-            'INSERT OR REPLACE INTO roles (id, name, color, position) VALUES (?, ?, ?, ?)',
-            (role_id, name, str(color), position)
-        )
-
-def _upsert_member_sync(member_id, name, display_name, joined_at, roles=None):
-    """
-    Upserts a member record.
-    roles: list of role name strings. If None, the existing roles column is preserved.
-    """
-    with get_discovery_conn() as conn:
-        if roles is not None:
-            roles_json = json.dumps(roles, ensure_ascii=False)
-            conn.execute(
-                '''INSERT INTO members (id, name, display_name, joined_at, roles)
-                   VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET
-                       name         = excluded.name,
-                       display_name = excluded.display_name,
-                       joined_at    = excluded.joined_at,
-                       roles        = excluded.roles''',
-                (member_id, name, display_name, str(joined_at), roles_json)
-            )
-        else:
-            conn.execute(
-                '''INSERT INTO members (id, name, display_name, joined_at)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET
-                       name         = excluded.name,
-                       display_name = excluded.display_name,
-                       joined_at    = excluded.joined_at''',
-                (member_id, name, display_name, str(joined_at))
-            )
-
-# ─── Delete Sync Functions ────────────────────────────────────────────────────
-
-def _delete_category_sync(category_id):
-    with get_discovery_conn() as conn:
-        conn.execute('DELETE FROM categories WHERE id = ?', (category_id,))
-
-def _delete_channel_sync(channel_id):
-    with get_discovery_conn() as conn:
-        conn.execute('DELETE FROM channels WHERE id = ?', (channel_id,))
-
-def _delete_role_sync(role_id):
-    with get_discovery_conn() as conn:
-        conn.execute('DELETE FROM roles WHERE id = ?', (role_id,))
-
-def _delete_member_sync(member_id):
-    with get_discovery_conn() as conn:
-        conn.execute('DELETE FROM members WHERE id = ?', (member_id,))
-
-# ─── Async Wrappers ───────────────────────────────────────────────────────────
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS categories (
+                    id   BIGINT PRIMARY KEY,
+                    name TEXT
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS channels (
+                    id          BIGINT PRIMARY KEY,
+                    name        TEXT,
+                    type        TEXT,
+                    category_id BIGINT,
+                    CONSTRAINT fk_category FOREIGN KEY (category_id) REFERENCES categories (id) ON DELETE SET NULL
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS roles (
+                    id       BIGINT PRIMARY KEY,
+                    name     TEXT,
+                    color    TEXT,
+                    position INTEGER
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS members (
+                    id           BIGINT PRIMARY KEY,
+                    name         TEXT,
+                    display_name TEXT,
+                    joined_at    TEXT,
+                    roles        JSONB DEFAULT '[]'::jsonb
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS messages (
+                    id         BIGINT PRIMARY KEY,
+                    channel_id BIGINT,
+                    author_id  BIGINT,
+                    content    TEXT,
+                    created_at TEXT
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS scheduled_events (
+                    id          BIGINT PRIMARY KEY,
+                    name        TEXT,
+                    description TEXT,
+                    start_time  TEXT,
+                    end_time    TEXT,
+                    status      INTEGER
+                )
+            ''')
+        conn.commit()
 
 async def initialize_discovery_db():
     await db_execute(_initialize_discovery_db_sync)
+
+# ─── Upsert Functions ─────────────────────────────────────────────────────────
+
+def _upsert_category_sync(category_id, name):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''
+                INSERT INTO categories (id, name) VALUES (%s, %s)
+                ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+            ''', (category_id, name))
+        conn.commit()
+
+def _upsert_channel_sync(channel_id, name, channel_type, category_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''
+                INSERT INTO channels (id, name, type, category_id) VALUES (%s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET 
+                    name = EXCLUDED.name, 
+                    type = EXCLUDED.type, 
+                    category_id = EXCLUDED.category_id
+            ''', (channel_id, name, channel_type, category_id))
+        conn.commit()
+
+def _upsert_role_sync(role_id, name, color, position):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''
+                INSERT INTO roles (id, name, color, position) VALUES (%s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET 
+                    name = EXCLUDED.name, 
+                    color = EXCLUDED.color, 
+                    position = EXCLUDED.position
+            ''', (role_id, name, str(color), position))
+        conn.commit()
+
+def _upsert_member_sync(member_id, name, display_name, joined_at, roles=None):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if roles is not None:
+                roles_json = json.dumps(roles, ensure_ascii=False)
+                cur.execute('''
+                    INSERT INTO members (id, name, display_name, joined_at, roles)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT(id) DO UPDATE SET
+                        name         = EXCLUDED.name,
+                        display_name = EXCLUDED.display_name,
+                        joined_at    = EXCLUDED.joined_at,
+                        roles        = EXCLUDED.roles
+                ''', (member_id, name, display_name, str(joined_at), roles_json))
+            else:
+                cur.execute('''
+                    INSERT INTO members (id, name, display_name, joined_at)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT(id) DO UPDATE SET
+                        name         = EXCLUDED.name,
+                        display_name = EXCLUDED.display_name,
+                        joined_at    = EXCLUDED.joined_at
+                ''', (member_id, name, display_name, str(joined_at)))
+        conn.commit()
+
+# ─── Delete Functions ─────────────────────────────────────────────────────────
+
+def _delete_category_sync(category_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('DELETE FROM categories WHERE id = %s', (category_id,))
+        conn.commit()
+
+def _delete_channel_sync(channel_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('DELETE FROM channels WHERE id = %s', (channel_id,))
+        conn.commit()
+
+def _delete_role_sync(role_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('DELETE FROM roles WHERE id = %s', (role_id,))
+        conn.commit()
+
+def _delete_member_sync(member_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('DELETE FROM members WHERE id = %s', (member_id,))
+        conn.commit()
+
+def _upsert_message_sync(message_id, channel_id, author_id, content, created_at):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''
+                INSERT INTO messages (id, channel_id, author_id, content, created_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET 
+                    channel_id = EXCLUDED.channel_id,
+                    author_id = EXCLUDED.author_id,
+                    content = EXCLUDED.content,
+                    created_at = EXCLUDED.created_at
+            ''', (message_id, channel_id, author_id, content, str(created_at)))
+        conn.commit()
+
+def _delete_message_sync(message_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('DELETE FROM messages WHERE id = %s', (message_id,))
+        conn.commit()
+
+def _upsert_scheduled_event_sync(event_id, name, description, start_time, end_time, status):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('''
+                INSERT INTO scheduled_events (id, name, description, start_time, end_time, status)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    description = EXCLUDED.description,
+                    start_time = EXCLUDED.start_time,
+                    end_time = EXCLUDED.end_time,
+                    status = EXCLUDED.status
+            ''', (event_id, name, description, str(start_time), str(end_time) if end_time else None, status))
+        conn.commit()
+
+def _delete_scheduled_event_sync(event_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('DELETE FROM scheduled_events WHERE id = %s', (event_id,))
+        conn.commit()
+
+# ─── Async Wrappers ───────────────────────────────────────────────────────────
 
 async def upsert_category(category_id, name):
     await db_execute(_upsert_category_sync, category_id, name)
@@ -167,8 +211,13 @@ async def upsert_role(role_id, name, color, position):
     await db_execute(_upsert_role_sync, role_id, name, color, position)
 
 async def upsert_member(member_id, name, display_name, joined_at, roles=None):
-    """roles: optional list of role name strings to store on the member row."""
     await db_execute(_upsert_member_sync, member_id, name, display_name, joined_at, roles)
+
+async def upsert_message(message_id, channel_id, author_id, content, created_at):
+    await db_execute(_upsert_message_sync, message_id, channel_id, author_id, content, created_at)
+
+async def upsert_scheduled_event(event_id, name, description, start_time, end_time, status):
+    await db_execute(_upsert_scheduled_event_sync, event_id, name, description, start_time, end_time, status)
 
 async def delete_category(category_id):
     await db_execute(_delete_category_sync, category_id)
@@ -182,59 +231,84 @@ async def delete_role(role_id):
 async def delete_member(member_id):
     await db_execute(_delete_member_sync, member_id)
 
-# ─── Query Functions (synchronous) ───────────────────────────────────────────
+async def delete_message(message_id):
+    await db_execute(_delete_message_sync, message_id)
 
-def get_channel_id_by_name(name):
-    """Return the Discord ID of a channel by its name, or None."""
-    with get_discovery_conn() as conn:
-        result = conn.execute('SELECT id FROM channels WHERE name = ?', (name,)).fetchone()
-        return result['id'] if result else None
+async def delete_scheduled_event(event_id):
+    await db_execute(_delete_scheduled_event_sync, event_id)
 
-def get_role_id_by_name(name):
-    """Return the Discord ID of a role by its name, or None."""
-    with get_discovery_conn() as conn:
-        result = conn.execute('SELECT id FROM roles WHERE name = ?', (name,)).fetchone()
-        return result['id'] if result else None
+# ─── Query Functions ─────────────────────────────────────────────────────────
 
-def get_member_roles(member_id):
-    """Return list of role name strings for a member."""
-    with get_discovery_conn() as conn:
-        result = conn.execute('SELECT roles FROM members WHERE id = ?', (member_id,)).fetchone()
-        if result and result['roles']:
-            return json.loads(result['roles'])
-        return []
+async def get_category_id_by_name(name):
+    def _fetch():
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT id FROM categories WHERE name = %s', (name,))
+                result = cur.fetchone()
+                return result['id'] if result else None
+    return await db_execute(_fetch)
 
-def member_has_role(member_id, role_name):
-    """Return True if the member currently holds the given role (by name)."""
-    return role_name in get_member_roles(member_id)
+async def get_channel_id_by_name(name):
+    def _fetch():
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT id FROM channels WHERE name = %s', (name,))
+                result = cur.fetchone()
+                return result['id'] if result else None
+    return await db_execute(_fetch)
 
-def get_members_with_role(role_name):
-    """Return list of member dicts [{id, name, display_name, roles}] who hold a given role."""
-    with get_discovery_conn() as conn:
-        # JSON search via LIKE — works for exact role names
-        rows = conn.execute(
-            "SELECT id, name, display_name, roles FROM members WHERE roles LIKE ?",
-            (f'%"{role_name}"%',)
-        ).fetchall()
-        return [dict(r) for r in rows]
+async def get_role_id_by_name(name):
+    def _fetch():
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT id FROM roles WHERE name = %s', (name,))
+                result = cur.fetchone()
+                return result['id'] if result else None
+    return await db_execute(_fetch)
+
+async def get_member_roles(member_id):
+    def _fetch():
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT roles FROM members WHERE id = %s', (member_id,))
+                result = cur.fetchone()
+                if result and result['roles']:
+                    return result['roles'] if isinstance(result['roles'], list) else json.loads(result['roles'])
+                return []
+    return await db_execute(_fetch)
+
+async def member_has_role(member_id, role_name):
+    roles = await get_member_roles(member_id)
+    return role_name in roles
+
+async def get_members_with_role(role_name):
+    def _fetch():
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, name, display_name, roles FROM members WHERE roles ? %s",
+                    (role_name,)
+                )
+                rows = cur.fetchall()
+                return [dict(r) for r in rows]
+    return await db_execute(_fetch)
 
 # ─── Convenience Status Helpers ───────────────────────────────────────────────
 
-def is_on_leave(member_id):
-    """True if the member currently has the 'On Leave' role."""
-    return member_has_role(member_id, 'On Leave')
+async def is_on_leave(member_id):
+    return await member_has_role(member_id, 'On Leave')
 
-def has_submitted_dar(member_id):
-    """True if the member currently has the 'D.A.R Submitted' role."""
-    return member_has_role(member_id, 'D.A.R Submitted')
+async def has_submitted_dar(member_id):
+    return await member_has_role(member_id, 'D.A.R Submitted')
 
-def get_members_on_leave():
-    """Return all members currently marked On Leave."""
-    return get_members_with_role('On Leave')
+async def get_members_on_leave():
+    return await get_members_with_role('On Leave')
 
-def get_members_dar_pending():
-    """Return all members who have NOT yet submitted their DAR today."""
-    submitted = {m['id'] for m in get_members_with_role('D.A.R Submitted')}
-    with get_discovery_conn() as conn:
-        all_members = conn.execute('SELECT id, name, display_name FROM members').fetchall()
-        return [dict(m) for m in all_members if m['id'] not in submitted]
+async def get_members_dar_pending():
+    def _fetch():
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, name, display_name FROM members WHERE NOT (roles ? 'D.A.R Submitted')")
+                rows = cur.fetchall()
+                return [dict(m) for m in rows]
+    return await db_execute(_fetch)

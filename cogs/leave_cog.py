@@ -10,7 +10,10 @@ import re
 import asyncio
 import logging
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+# IST Timezone — single source of truth
+from Bots.utils.timezone import IST
 
 import discord
 from discord.ext import commands
@@ -20,10 +23,10 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import Alignment, Font
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'Bots'))
-from db_managers import leave_db_manager as db
+from Bots.db_managers import leave_db_manager as db
+from Bots.db_managers import discovery_db_manager as discovery
 
-from db_managers import discovery_db_manager as discovery
+logger = logging.getLogger("Concord")
 
 # ─── Channel / Role Configuration ────────────────────────────────────────────
 # These are the logical name → channel/role name mappings.
@@ -91,7 +94,7 @@ DEPARTMENT_ROLES        = dict(_DEPARTMENT_ROLES_FALLBACK)
 DIRECT_SECOND_APPROVAL_ROLES = dict(_DIRECT_SECOND_APPROVAL_ROLES_FALLBACK)
 
 
-def resolve_leave_config():
+async def resolve_leave_config():
     """
     Queries discovery.db to resolve channel and role IDs by name.
     Called once at startup by LeaveCog.cog_load().
@@ -100,46 +103,47 @@ def resolve_leave_config():
     global SUBMIT_CHANNEL_ID, EMP_ROLE_ID, APPROVAL_CHANNELS, DEPARTMENT_ROLES, DIRECT_SECOND_APPROVAL_ROLES
 
     # Resolve submit channel
-    resolved_submit = discovery.get_channel_id_by_name('leave-application')
+    resolved_submit = await discovery.get_channel_id_by_name('leave-application')
     if resolved_submit:
         SUBMIT_CHANNEL_ID = resolved_submit
-        logging.info(f"[Leave Config] #leave-application → {resolved_submit}")
+        logger.info(f"[Leave Config] #leave-application → {resolved_submit}")
     else:
-        logging.warning("[Leave Config] Channel 'leave-application' not found in discovery.db — using fallback ID")
+        logger.warning("[ERR-LV-001] [Leave Config] Channel 'leave-application' not found in discovery.db — using fallback ID")
 
     # Resolve employee role
-    resolved_emp = discovery.get_role_id_by_name('emp')
+    resolved_emp = await discovery.get_role_id_by_name('emp')
     if resolved_emp:
         EMP_ROLE_ID = resolved_emp
-        logging.info(f"[Leave Config] @emp → {resolved_emp}")
+        logger.info(f"[Leave Config] @emp → {resolved_emp}")
     else:
-        logging.warning("[Leave Config] Role 'emp' not found in discovery.db — using fallback ID")
+        logger.warning("[ERR-LV-002] [Leave Config] Role 'emp' not found in discovery.db — using fallback ID")
 
     # Resolve approval channels
     for key, ch_name in _APPROVAL_CHANNEL_NAMES.items():
-        resolved = discovery.get_channel_id_by_name(ch_name)
+        resolved = await discovery.get_channel_id_by_name(ch_name)
         if resolved:
             APPROVAL_CHANNELS[key] = resolved
-            logging.info(f"[Leave Config] #{ch_name} → {resolved}")
+            logger.info(f"[Leave Config] #{ch_name} → {resolved}")
         else:
-            logging.warning(f"[Leave Config] Channel '{ch_name}' not found in discovery.db — using fallback ID for '{key}'")
+            logger.warning(f"[ERR-LV-003] [Leave Config] Channel '{ch_name}' not found in discovery.db — using fallback ID for '{key}'")
 
     # Resolve department roles
     for key, role_name in _DEPARTMENT_ROLE_NAMES.items():
-        resolved = discovery.get_role_id_by_name(role_name)
+        resolved = await discovery.get_role_id_by_name(role_name)
         if resolved:
             DEPARTMENT_ROLES[key] = resolved
-            logging.info(f"[Leave Config] @{role_name} → {resolved}")
+            logger.info(f"[Leave Config] @{role_name} → {resolved}")
         else:
-            logging.warning(f"[Leave Config] Role '{role_name}' not found in discovery.db — using fallback ID for '{key}'")
+            logger.warning(f"[ERR-LV-004] [Leave Config] Role '{role_name}' not found in discovery.db — using fallback ID for '{key}'")
 
     # Resolve direct second-approval roles
     for key, role_name in _DIRECT_SECOND_APPROVAL_ROLE_NAMES.items():
-        resolved = discovery.get_role_id_by_name(role_name)
+        resolved = await discovery.get_role_id_by_name(role_name)
         if resolved:
             DIRECT_SECOND_APPROVAL_ROLES[key] = resolved
+            logger.info(f"[Leave Config] @{role_name} → {resolved}")
         else:
-            logging.warning(f"[Leave Config] Role '{role_name}' not found in discovery.db — using fallback ID for '{key}'")
+            logger.warning(f"[ERR-LV-005] [Leave Config] Role '{role_name}' not found in discovery.db — using fallback ID for '{key}'")
 
     logging.info("[Leave Config] Configuration resolved from discovery.db.")
 
@@ -242,18 +246,38 @@ class LeaveApplicationView(View):
     async def leave_details_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         result = await db.fetch_dynamic_user(interaction.user.id)
         if result:
-            last_leave_taken, total_casual_leave, total_sick_leave = result
+            last_leave_taken = result.get('last_leave_taken', 'N/A')
+            total_casual_leave = result.get('total_casual_leave', 0)
+            total_sick_leave = result.get('total_sick_leave', 0)
+            
             await interaction.response.send_message(
                 f"Last Accepted Leave Date: {last_leave_taken}\n"
                 f"Total Casual Leave: {total_casual_leave}\n"
                 f"Total Sick Leave: {total_sick_leave}",
                 ephemeral=True,
+                delete_after=10
             )
         else:
             await interaction.response.send_message("No leave details found.", ephemeral=True, delete_after=10)
 
 
 
+
+class ReasonModal(discord.ui.Modal):
+    def __init__(self, title: str, label_text: str, callback_func):
+        super().__init__(title=title)
+        self.callback_func = callback_func
+        self.add_item(discord.ui.TextInput(
+            label=label_text,
+            style=discord.TextStyle.paragraph,
+            max_length=1024,
+            placeholder="Please provide a reason...",
+            required=True
+        ))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        reason = self.children[0].value.strip()
+        await self.callback_func(interaction, reason)
 
 class DMLeaveActionView(discord.ui.View):
     def __init__(self, leave_id: int, stage: str, bot_ref=None):
@@ -274,114 +298,159 @@ class DMLeaveActionView(discord.ui.View):
             self.add_item(btn)
 
     async def cancel_leave(self, interaction: discord.Interaction):
-        bot = self._bot or interaction.client
-        guild = bot.guilds[0]
-        member = guild.get_member(interaction.user.id)
-        nickname = member.display_name if member else interaction.user.display_name
-        
-        leave_id = self.leave_id
-        result = await db.get_pending_leave_status(nickname, leave_id)
-        if result:
-            leave_reason, number_of_days_off = result
-            await db.withdraw_leave(nickname, leave_id)
-            await db.reduce_leave_balance(interaction.user.id, leave_reason.lower(), number_of_days_off)
-            await db.update_last_leave_date_after_withdrawal(nickname, interaction.user.id)
+        async def cancel_callback(modal_interaction: discord.Interaction, reason: str):
+            bot = self._bot or modal_interaction.client
+            guild = bot.guilds[0]
+            member = guild.get_member(modal_interaction.user.id)
+            nickname = member.display_name if member else modal_interaction.user.display_name
             
-            await interaction.response.send_message(f"Leave {leave_id} cancelled successfully.", ephemeral=True, delete_after=10)
-            for item in self.children:
-                item.disabled = True
-            
-            embed = interaction.message.embeds[0] if interaction.message.embeds else None
-            if embed:
-                for i, field in enumerate(embed.fields):
-                    if field.name == "Status":
-                        embed.set_field_at(i, name="Status", value="Cancelled", inline=False)
-                        break
-            
-            await interaction.message.edit(view=self, embed=embed)
-            
-            try:
-                footer = await db.get_footer_text(nickname, leave_id)
-                if footer and footer[0]:
-                    parts = footer[0].split(" | ")
-                    channel_id = int(parts[3].split(": ")[1])
-                    message_id = int(parts[4].split(": ")[1])
-                    channel = bot.get_channel(channel_id)
-                    if channel:
-                        msg = await channel.fetch_message(message_id)
-                        await msg.delete()
-            except Exception as e:
-                logging.error(f"[Leave] Error deleting pending leave embed: {e}")
-        else:
-            await interaction.response.send_message(f"Leave {leave_id} not found or is no longer pending.", ephemeral=True, delete_after=10)
+            leave_id = self.leave_id
+            result = await db.get_pending_leave_status(nickname, leave_id)
+            if result:
+                leave_reason = result['leave_reason']
+                number_of_days_off = result['number_of_days_off']
+                await db.withdraw_leave(nickname, leave_id, cancelled_by=nickname, cancellation_reason=reason)
+                # Do not modify balance because it was only pending
+                await db.update_last_leave_date_after_withdrawal(nickname, modal_interaction.user.id)
+                
+                await modal_interaction.response.send_message(f"Leave {leave_id} cancelled successfully.", ephemeral=True, delete_after=10)
+                for item in self.children:
+                    item.disabled = True
+                
+                embed = interaction.message.embeds[0] if interaction.message.embeds else None
+                if embed:
+                    for i, field in enumerate(embed.fields):
+                        if field.name == "Status":
+                            embed.set_field_at(i, name="Status", value="Cancelled", inline=False)
+                            break
+                    embed.add_field(name="Cancelled By", value=nickname, inline=True)
+                    embed.add_field(name="Reason", value=reason, inline=True)
+                
+                await interaction.message.edit(view=self, embed=embed)
+                
+                try:
+                    res = await db.get_footer_text(nickname, leave_id)
+                    if res and res.get('footer_text'):
+                        parts = res['footer_text'].split(" | ")
+                        channel_id = int(parts[3].split(": ")[1])
+                        message_id = int(parts[4].split(": ")[1])
+                        channel = bot.get_channel(channel_id)
+                        if channel:
+                            msg = await channel.fetch_message(message_id)
+                            await msg.delete()
+                except Exception as e:
+                    logging.error(f"[ERR-LV-006] [Leave] Error deleting pending leave embed: {e}")
+            else:
+                await modal_interaction.response.send_message(f"Leave {leave_id} not found or is no longer pending.", ephemeral=True, delete_after=10)
+                
+        await interaction.response.send_modal(ReasonModal("Cancel Leave", "Reason for Cancellation", cancel_callback))
 
     async def request_withdraw(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        leave_id = self.leave_id
-        bot = self._bot or interaction.client
-        guild = bot.guilds[0]
-        member = guild.get_member(interaction.user.id)
-        nickname = member.display_name if member else interaction.user.display_name
+        async def withdraw_request_callback(modal_interaction: discord.Interaction, reason: str):
+            try:
+                await modal_interaction.response.defer(ephemeral=True)
+                leave_id = self.leave_id
+                bot = self._bot or modal_interaction.client
+                
+                logger.info(f"[Leave] Initiating withdraw_request_callback for Leave ID {leave_id}")
 
-        # Mark as cancellation requested in DB
-        await db.request_withdraw_leave(nickname, leave_id)
+                guild = bot.guilds[0] if bot.guilds else None
+                if not guild:
+                    logger.error("[ERR-LV-007] [Leave] Bot is not in any guilds. Cannot process request.")
+                    await _send_ephemeral(modal_interaction, "❌ Call [ERR-LV-008]: Bot connection error. Please try again later.")
+                    return
 
-        # Update the DM embed to show pending cancellation status
-        for item in self.children:
-            item.disabled = True
-        embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed(title="Leave Application Status")
-        for i, field in enumerate(embed.fields):
-            if field.name == "Status":
-                embed.set_field_at(i, name="Status", value="⏳ Cancellation Requested — awaiting HR approval", inline=False)
-                break
-        await interaction.message.edit(view=self, embed=embed)
-        await _send_ephemeral(interaction, f"Cancellation request sent for Leave ID {leave_id}. HR will review it shortly.")
+                member = guild.get_member(modal_interaction.user.id)
+                nickname = member.display_name if member else modal_interaction.user.display_name
+                logger.info(f"[Leave] User: {nickname} (ID: {modal_interaction.user.id})")
 
-        # Send a new cancellation-request message to the HR channel with Approve / Reject buttons
-        try:
-            hr_ch_id = APPROVAL_CHANNELS.get('hr')
-            hr_channel = bot.get_channel(hr_ch_id)
-            if hr_channel:
-                footer = await db.get_footer_text(nickname, leave_id)
-                footer_text = footer[0] if footer and footer[0] else ""
+                # Update DB status
+                await db.request_withdraw_leave(nickname, leave_id, requested_by=nickname, reason=reason)
+                logger.info(f"[Leave] DB updated to 'Withdrawal Requested' for ID {leave_id}")
 
-                # Fetch full leave row for richer embed
-                leave_row = await db.get_leave_full_details(nickname, leave_id)
+                # Update local message
+                for item in self.children:
+                    item.disabled = True
+                embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed(title="Leave Application Status")
+                
+                # Update Status field if it exists
+                status_updated = False
+                for i, field in enumerate(embed.fields):
+                    if field.name == "Status":
+                        embed.set_field_at(i, name="Status", value="⏳ Cancellation Requested — awaiting HR approval", inline=False)
+                        status_updated = True
+                        break
+                if not status_updated:
+                    embed.add_field(name="Status", value="⏳ Cancellation Requested — awaiting HR approval", inline=False)
+                
+                embed.add_field(name="Reason", value=reason, inline=False)
+                await interaction.message.edit(view=self, embed=embed)
+                logger.info(f"[Leave] Local DM message updated for ID {leave_id}")
 
-                cancel_embed = discord.Embed(
-                    title="📥 Cancellation Request",
-                    description=f"**{nickname}** has requested cancellation of an approved leave.",
-                    color=0xF39C12
-                )
-                cancel_embed.add_field(name="Leave ID",   value=leave_id,  inline=True)
-                cancel_embed.add_field(name="Member",     value=nickname,  inline=True)
-                cancel_embed.add_field(name="\u200b",      value="\u200b",  inline=True)
+                await _send_ephemeral(modal_interaction, f"Cancellation request sent for Leave ID {leave_id}. HR will review it shortly.")
 
-                if leave_row:
-                    leave_type = leave_row.get('leave_type') or leave_row.get('leave_reason') or 'N/A'
-                    date_from  = leave_row.get('date_from', 'N/A')
-                    date_to    = leave_row.get('date_to') or date_from
-                    days_off   = leave_row.get('number_of_days_off', 'N/A')
-                    reason     = leave_row.get('leave_reason', 'N/A')
-                    cancel_embed.add_field(name="Leave Type",  value=leave_type,                inline=True)
-                    cancel_embed.add_field(name="Dates",       value=f"{date_from} → {date_to}", inline=True)
-                    cancel_embed.add_field(name="Days Off",    value=days_off,                  inline=True)
-                    cancel_embed.add_field(name="Reason",      value=reason,                    inline=False)
+                # Resolve HR Channel
+                hr_ch_id = APPROVAL_CHANNELS.get('hr')
+                if not hr_ch_id:
+                    logger.error("[ERR-LV-009] [Leave] HR Channel ID not found in APPROVAL_CHANNELS config.")
+                    await _send_ephemeral(modal_interaction, "❌ Call [ERR-LV-010]: Configuration error: HR channel not set.")
+                    return
 
-                cancel_embed.set_footer(text=f"User ID: {interaction.user.id} | Leave ID: {leave_id}")
+                logger.info(f"[Leave] Resolving HR Channel ID: {hr_ch_id}")
+                hr_channel = bot.get_channel(int(hr_ch_id))
+                if not hr_channel:
+                    try:
+                        logger.info(f"[Leave] Channel not in cache, fetching ID: {hr_ch_id}")
+                        hr_channel = await bot.fetch_channel(int(hr_ch_id))
+                    except Exception as fe:
+                        logger.error(f"[ERR-LV-011] [Leave] Failed to fetch channel {hr_ch_id}: {fe}")
+                        hr_channel = None
 
-                cancel_view = CancellationRequestView(
-                    user_id=interaction.user.id,
-                    leave_id=leave_id,
-                    nickname=nickname,
-                    footer_text=footer_text,
-                    bot_ref=bot
-                )
-                await hr_channel.send(embed=cancel_embed, view=cancel_view)
-            else:
-                logging.error(f"[Leave] HR channel {hr_ch_id} not found for cancellation request.")
-        except Exception as e:
-            logging.error(f"[Leave] Error sending cancellation request to HR: {e}")
+                if hr_channel:
+                    res = await db.get_footer_text(nickname, leave_id)
+                    footer_text = res['footer_text'] if res and res.get('footer_text') else ""
+
+                    leave_row = await db.get_leave_full_details(nickname, leave_id)
+                    
+                    cancel_embed = discord.Embed(
+                        title="📥 Cancellation Request",
+                        description=f"**{nickname}** has requested cancellation of an approved leave.",
+                        color=0xF39C12
+                    )
+                    cancel_embed.add_field(name="Leave ID",   value=leave_id,  inline=True)
+                    cancel_embed.add_field(name="Member",     value=nickname,  inline=True)
+                    cancel_embed.add_field(name="\u200b",      value="\u200b",  inline=True)
+
+                    if leave_row:
+                        leave_type = leave_row.get('leave_type') or leave_row.get('leave_reason') or 'N/A'
+                        date_from  = leave_row.get('date_from', 'N/A')
+                        date_to    = leave_row.get('date_to') or date_from
+                        days_off   = leave_row.get('number_of_days_off', 'N/A')
+                        cancel_embed.add_field(name="Leave Type",  value=leave_type,                inline=True)
+                        cancel_embed.add_field(name="Dates",       value=f"{date_from} → {date_to}", inline=True)
+                        cancel_embed.add_field(name="Days Off",    value=days_off,                  inline=True)
+                        cancel_embed.add_field(name="Reason",      value=reason,                    inline=False)
+
+                    cancel_embed.set_footer(text=f"User ID: {modal_interaction.user.id} | Leave ID: {leave_id}")
+
+                    cancel_view = CancellationRequestView(
+                        user_id=modal_interaction.user.id,
+                        leave_id=leave_id,
+                        nickname=nickname,
+                        footer_text=footer_text,
+                        bot_ref=bot
+                    )
+                    await hr_channel.send(embed=cancel_embed, view=cancel_view)
+                    logger.info(f"[Leave] Cancellation request sent to HR channel for ID {leave_id}")
+                else:
+                    logger.error(f"[ERR-LV-012] [Leave] HR channel {hr_ch_id} could not be resolved. Notification NOT sent.")
+                    await _send_ephemeral(modal_interaction, "⚠️ Call [ERR-LV-013]: Request recorded, but HR notification failed. Please inform HR manually.")
+
+            except Exception as e:
+                logger.exception(f"[ERR-LV-014] [Leave] Fatal error in withdraw_request_callback: {e}")
+                await _send_ephemeral(modal_interaction, "❌ Call [ERR-LV-015]: A system error occurred while processing your cancellation request.")
+
+        await interaction.response.send_modal(ReasonModal("Request Cancellation", "Reason for Cancellation", withdraw_request_callback))
 
 
 class CancellationRequestView(View):
@@ -408,11 +477,17 @@ class CancellationRequestView(View):
         await interaction.response.defer(ephemeral=True)
         bot = self._bot or interaction.client
         try:
-            result = await db.get_leave_status(self.nickname, self.leave_id)
-            if result:
-                leave_reason, days_off = result
-                await db.withdraw_leave(self.nickname, self.leave_id)
-                await db.reduce_leave_balance(self.user_id, leave_reason.lower(), days_off)
+            leave_row = await db.get_leave_full_details(self.nickname, self.leave_id)
+            if leave_row:
+                leave_reason = leave_row.get('leave_reason', 'N/A')
+                days_off = leave_row.get('number_of_days_off', 0.0)
+                
+                # Fetch existing cancellation details if they exist to pass through
+                existing_cancelled_by = leave_row.get('cancelled_by')
+                existing_reason = leave_row.get('cancellation_reason')
+                
+                await db.withdraw_leave(self.nickname, self.leave_id, cancelled_by=existing_cancelled_by, cancellation_reason=existing_reason)
+                await db.refund_leave_balance(self.user_id, leave_reason.lower(), days_off)
                 await db.update_last_leave_date_after_withdrawal(self.nickname, self.user_id)
 
             # Update the original HR approval message to show Cancelled status
@@ -442,7 +517,7 @@ class CancellationRequestView(View):
                         except discord.NotFound:
                             pass
             except Exception as e:
-                logging.error(f"[Leave] Could not update original HR message after cancellation: {e}")
+                logging.error(f"[ERR-LV-016] [Leave] Could not update original HR message after cancellation: {e}")
 
             # Notify user via DM
             await update_persistent_dm(
@@ -459,8 +534,8 @@ class CancellationRequestView(View):
             await interaction.message.delete()
 
         except Exception as e:
-            logging.error(f"[Leave] CancellationRequestView approve error: {e}")
-            await _send_ephemeral(interaction, "An error occurred.")
+            logging.error(f"[ERR-LV-017] [Leave] CancellationRequestView approve error: {e}")
+            await _send_ephemeral(interaction, "An error occurred [ERR-LV-018].")
 
     @discord.ui.button(label="Reject Cancellation", style=discord.ButtonStyle.danger, custom_id="cancel_reject")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -484,8 +559,8 @@ class CancellationRequestView(View):
             await interaction.message.delete()
 
         except Exception as e:
-            logging.error(f"[Leave] CancellationRequestView reject error: {e}")
-            await _send_ephemeral(interaction, "An error occurred.")
+            logging.error(f"[ERR-LV-019] [Leave] CancellationRequestView reject error: {e}")
+            await _send_ephemeral(interaction, "An error occurred [ERR-LV-020].")
 
 
 
@@ -500,31 +575,43 @@ class ApprovedActionsView(View):
 
     @discord.ui.button(label="Withdraw", style=discord.ButtonStyle.danger, custom_id="withdraw_approved_leave")
     async def withdraw_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        leave_id = self.leave_details['leave_id']
-        result = await db.get_leave_status(self.nickname, leave_id)
-        if result:
-            leave_reason, number_of_days_off = result
-            await db.withdraw_leave(self.nickname, leave_id)
-            await db.reduce_leave_balance(self.user_id, leave_reason.lower(), number_of_days_off)
-            await db.update_last_leave_date_after_withdrawal(self.nickname, self.user_id)
-            await interaction.response.send_message(f"Leave {leave_id} withdrawn.", ephemeral=True, delete_after=10)
-            for item in self.children:
-                item.disabled = True
-            await interaction.message.edit(view=self)
-            
-            # Message user about the HR withdrawal
-            try:
-                bot = self._bot or interaction.client
-                footer = await db.get_footer_text(self.nickname, leave_id)
-                if footer and footer[0]:
-                    await update_persistent_dm(bot, self.user_id, self.leave_details, 'final', footer[0], status_msg="Your leave has been formally withdrawn by HR/Management.", color=0xE74C3C)
-                else:
-                    user = await bot.fetch_user(self.user_id)
-                    await user.send(f"Your leave (ID: {leave_id}) has been formally withdrawn by HR/Management.")
-            except Exception as e:
-                logging.error(f"[Leave] Error updating DM on HR withdrawal: {e}")
-        else:
-            await interaction.response.send_message(f"Leave {leave_id} not found or could not be withdrawn.", ephemeral=True, delete_after=10)
+        async def hr_withdraw_callback(modal_interaction: discord.Interaction, reason: str):
+            leave_id = self.leave_details['leave_id']
+            result = await db.get_leave_status(self.nickname, leave_id)
+            if result:
+                leave_reason = result['leave_reason']
+                number_of_days_off = result['number_of_days_off']
+                hr_nickname = modal_interaction.user.display_name
+                await db.withdraw_leave(self.nickname, leave_id, cancelled_by=f"HR ({hr_nickname})", cancellation_reason=reason)
+                if leave_reason:
+                    await db.refund_leave_balance(self.user_id, leave_reason.lower(), number_of_days_off)
+                await db.update_last_leave_date_after_withdrawal(self.nickname, self.user_id)
+                await modal_interaction.response.send_message(f"Leave {leave_id} withdrawn.", ephemeral=True, delete_after=10)
+                for item in self.children:
+                    item.disabled = True
+                
+                embed = interaction.message.embeds[0] if interaction.message.embeds else None
+                if embed:
+                    embed.add_field(name="Cancelled By", value=f"HR ({hr_nickname})", inline=True)
+                    embed.add_field(name="Reason", value=reason, inline=True)
+                
+                await interaction.message.edit(view=self, embed=embed)
+                
+                # Message user about the HR withdrawal
+                try:
+                    bot = self._bot or modal_interaction.client
+                    res = await db.get_footer_text(self.nickname, leave_id)
+                    if res and res.get('footer_text'):
+                        await update_persistent_dm(bot, self.user_id, self.leave_details, 'final', res['footer_text'], status_msg=f"Your leave has been formally withdrawn by HR/Management.\nReason: {reason}", color=0xE74C3C)
+                    else:
+                        user = await bot.fetch_user(self.user_id)
+                        await user.send(f"Your leave (ID: {leave_id}) has been formally withdrawn by HR/Management.\nReason: {reason}")
+                except Exception as e:
+                    logging.error(f"[ERR-LV-021] [Leave] Error updating DM on HR withdrawal: {e}")
+            else:
+                await modal_interaction.response.send_message(f"Leave {leave_id} not found or could not be withdrawn.", ephemeral=True, delete_after=10)
+                
+        await interaction.response.send_modal(ReasonModal("Withdraw Leave", "Reason for Withdrawal", hr_withdraw_callback))
 
 
 class LeaveApprovalView(View):
@@ -542,15 +629,13 @@ class LeaveApprovalView(View):
             result = await db.get_pending_leave_status(self.nickname, self.leave_details['leave_id'])
             # If not pending, it might be Withdrawal Requested
             if not result:
-                # We need a custom fetch to check just the status
-                table_name = db.sanitize_table_name(self.nickname)
-                with db.get_leave_conn() as conn:
-                    status = conn.execute(f"SELECT leave_status FROM {table_name} WHERE leave_id = ?", (self.leave_details['leave_id'],)).fetchone()
-                    if status and status[0] == 'Withdrawal Requested':
-                        return True
+                # Use standard get_leave_full_details to check current status in PostgreSQL-native way
+                leave = await db.get_leave_full_details(self.nickname, self.leave_details['leave_id'])
+                if leave and leave.get('leave_status') == 'Withdrawal Requested':
+                    return True
             return False
         except Exception as e:
-            logging.error(f"[Leave] Error checking withdrawal request status: {e}")
+            logging.error(f"[ERR-LV-022] [Leave] Error checking withdrawal request status: {e}")
             return False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -574,14 +659,15 @@ class LeaveApprovalView(View):
             if item.custom_id and item.custom_id.startswith('hr_withdraw_'):
                 item.callback = self.handle_hr_withdrawal
             elif item.custom_id and item.custom_id.startswith('hr_accept_'):
-                # Wrap it to pass the hardcoded bool
-                async def accept_callback(interaction: discord.Interaction, btn=item):
-                    await self.handle_approval(interaction, True)
-                item.callback = accept_callback
+                item.callback = self.handle_hr_accept
             elif item.custom_id and item.custom_id.startswith('hr_decline_'):
-                async def decline_callback(interaction: discord.Interaction, btn=item):
-                    await self.handle_approval(interaction, False)
-                item.callback = decline_callback
+                item.callback = self.handle_hr_decline
+
+    async def handle_hr_accept(self, interaction: discord.Interaction):
+        await self.handle_approval(interaction, True)
+
+    async def handle_hr_decline(self, interaction: discord.Interaction):
+        await self.handle_approval(interaction, False)
 
     async def handle_hr_withdrawal(self, interaction: discord.Interaction):
         leave_id = self.leave_details['leave_id']
@@ -590,17 +676,16 @@ class LeaveApprovalView(View):
         # Confirm withdrawal in DB
         await db.confirm_withdraw_leave(self.nickname, leave_id)
         
-        # Re-fetch exact leave so we can decrement balance
+        # Re-fetch exact leave so we can decrement balance (PostgreSQL-native)
         try:
-            table_name = db.sanitize_table_name(self.nickname)
-            with db.get_leave_conn() as conn:
-                res = conn.execute(f"SELECT leave_reason, number_of_days_off FROM {table_name} WHERE leave_id = ?", (leave_id,)).fetchone()
-                if res:
-                    leave_reason, number_of_days_off = res
-                    if number_of_days_off is not None:
-                        await db.reduce_leave_balance(self.user_id, leave_reason.lower(), number_of_days_off)
+            res = await db.get_leave_full_details(self.nickname, leave_id)
+            if res:
+                leave_reason = res.get('leave_reason')
+                number_of_days_off = res.get('number_of_days_off')
+                if number_of_days_off is not None and leave_reason:
+                    await db.refund_leave_balance(self.user_id, leave_reason.lower(), number_of_days_off)
         except Exception as e:
-            logging.error(f"[Leave] Error fetching withdrawn leave details: {e}")
+            logging.error(f"[ERR-LV-023] [Leave] Error fetching withdrawn leave details: {e}")
         
         for item in self.children:
             item.disabled = True
@@ -617,11 +702,11 @@ class LeaveApprovalView(View):
         
         # Update persistent DM
         try:
-            footer = await db.get_footer_text(self.nickname, leave_id)
-            if footer and footer[0]:
-                await update_persistent_dm(bot, self.user_id, self.leave_details, 'final', footer[0], status_msg="Your leave has been formally withdrawn by HR/Management.", color=0xE74C3C)
+            res = await db.get_footer_text(self.nickname, leave_id)
+            if res and res.get('footer_text'):
+                await update_persistent_dm(bot, self.user_id, self.leave_details, 'final', res['footer_text'], status_msg="Your leave has been formally withdrawn by HR/Management.", color=0xE74C3C)
         except Exception as e:
-            logging.error(f"[Leave] Error updating DM after HR withdrawal: {e}")
+            logging.error(f"[ERR-LV-024] [Leave] Error updating DM after HR withdrawal: {e}")
 
     async def handle_approval(self, interaction: discord.Interaction, approved: bool):
         bot = self._bot or interaction.client
@@ -636,13 +721,26 @@ class LeaveApprovalView(View):
 
                 if self.current_stage == 'first':
                     second_ch_id = APPROVAL_CHANNELS.get('hr')
+                    second_ch_key = 'hr'
                     for role_name, role_id in DIRECT_SECOND_APPROVAL_ROLES.items():
                         if role_id in [r.id for r in interaction.user.roles]:
                             second_ch_id = APPROVAL_CHANNELS.get(role_name)
+                            second_ch_key = role_name
                             break
                     second_ch = bot.get_channel(second_ch_id)
                     if not second_ch:
-                        raise ValueError(f"Channel {second_ch_id} not found.")
+                        ch_name = _APPROVAL_CHANNEL_NAMES.get(second_ch_key, "leave-hr")
+                        guild = interaction.guild
+                        category = discord.utils.get(guild.categories, name="Leave Applications") or discord.utils.get(guild.categories, name="Leave applications")
+                        bot_role = guild.me.top_role
+                        overwrites = {
+                            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                            bot_role: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+                        }
+                        second_ch = await guild.create_text_channel(ch_name, category=category, overwrites=overwrites)
+                        APPROVAL_CHANNELS[second_ch_key] = second_ch.id
+                        await discovery.upsert_channel(second_ch.id, second_ch.name, 'text', category.id if category else 0)
+                        logging.getLogger("Concord").warning(f"[Leave] Auto-created missing approval channel #{ch_name}.")
                     
                     next_view = LeaveApprovalView(self.user_id, self.leave_details, 'second', self.nickname, bot_ref=bot)
                     await next_view._ensure_buttons_attached(interaction)
@@ -696,9 +794,9 @@ class LeaveApprovalView(View):
                 await _send_ephemeral(interaction, "Please use the Decline button to provide a reason.")
 
         except Exception as e:
-            print(f"[Leave] handle_approval error: {e}")
+            logging.exception(f"[ERR-LV-025] [Leave] handle_approval error: {e}")
             try:
-                await _send_ephemeral(interaction, "An error occurred while processing the approval.")
+                await _send_ephemeral(interaction, "Call [ERR-LV-026]: An error occurred while processing the approval.")
             except discord.errors.NotFound:
                 pass
 
@@ -751,7 +849,7 @@ class DeclineReasonModal(Modal):
         except Exception as e:
             print(f"[Leave] DeclineReasonModal error: {e}")
             try:
-                await _send_ephemeral(interaction, "An error occurred while processing the decline.")
+                await _send_ephemeral(interaction, "Call [ERR-LV-027]: An error occurred while processing the decline.")
             except discord.errors.NotFound:
                 pass
 
@@ -759,24 +857,26 @@ class DeclineReasonModal(Modal):
 class WithdrawLeaveModal(Modal):
     def __init__(self):
         super().__init__(title="Withdraw Leave Application")
-        self.add_item(TextInput(label="Leave ID", style=discord.TextStyle.short, max_length=10, placeholder="Enter Leave ID"))
+        self.add_item(discord.ui.TextInput(label="Leave ID", style=discord.TextStyle.short, max_length=10, placeholder="Enter Leave ID"))
+        self.add_item(discord.ui.TextInput(label="Reason for Withdrawal", style=discord.TextStyle.paragraph, max_length=1024, placeholder="Required reason...", required=True))
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             leave_id = int(self.children[0].value.strip())
+            reason = self.children[1].value.strip()
             user_id = interaction.user.id
             nickname = interaction.user.display_name
             result = await db.get_leave_status(nickname, leave_id)
             if result:
-                leave_reason, number_of_days_off = result
+                leave_reason = result['leave_reason']
+                number_of_days_off = result['number_of_days_off']
                 dynamic_result = await db.check_leave_owner(nickname)
-                if dynamic_result and dynamic_result[0] != user_id:
+                if dynamic_result and dynamic_result['user_id'] != user_id:
                     await interaction.response.send_message("You can only withdraw your own leave applications.", ephemeral=True, delete_after=10)
-                    return
-                await db.withdraw_leave(nickname, leave_id)
-                await db.reduce_leave_balance(user_id, leave_reason.lower(), number_of_days_off)
+                await db.withdraw_leave(nickname, leave_id, cancelled_by=nickname, cancellation_reason=reason)
+                await db.refund_leave_balance(user_id, leave_reason.lower(), number_of_days_off)
                 await db.update_last_leave_date_after_withdrawal(nickname, user_id)
-                await interaction.response.send_message(f"Leave {leave_id} has been withdrawn.", ephemeral=True, delete_after=10)
+                await interaction.response.send_message(f"Leave {leave_id} has been withdrawn.\nReason: {reason}", ephemeral=True, delete_after=10)
             else:
                 await interaction.response.send_message(f"Leave {leave_id} not found or not accepted.", ephemeral=True, delete_after=10)
         except ValueError:
@@ -814,20 +914,25 @@ class FullDayLeaveModal(Modal):
                 await interaction.response.send_message("START DATE CANNOT BE AFTER END DATE.", ephemeral=True, delete_after=10)
                 return
 
-            # Calculate days off excluding Sundays (weekday() == 6)
-            # Adjusting per usual standard that Sunday is a weekly off
+            # Calculate days off excluding Sundays AND national holidays
             days_off = 0
             current_date = date_from
             while current_date <= date_to:
-                if current_date.weekday() != 6:  # Skip Sundays
+                date_check = current_date.strftime("%d-%m-%Y")
+                is_hol = await db.is_holiday(date_check)
+                if current_date.weekday() != 6 and not is_hol:  # Skip Sundays & holidays
                     days_off += 1
                 current_date += timedelta(days=1)
             
             number_of_days_off = float(days_off)
 
-            # Next working day (Resume Office On)
+            # Next working day (Resume Office On) — skip Sundays and holidays
             resume_date = date_to + timedelta(days=1)
-            if resume_date.weekday() == 6:  # If resume date is Sunday, move to Monday
+            while True:
+                resume_check = resume_date.strftime("%d-%m-%Y")
+                is_resume_hol = await db.is_holiday(resume_check)
+                if resume_date.weekday() != 6 and not is_resume_hol:
+                    break
                 resume_date += timedelta(days=1)
             
             resume_office_on = resume_date.strftime("%d-%m-%Y")
@@ -849,7 +954,7 @@ class FullDayLeaveModal(Modal):
             if not interaction.response.is_done():
                 await interaction.response.send_message(f"AN ERROR OCCURRED: {e}", ephemeral=True, delete_after=10)
             else:
-                await _send_ephemeral(interaction, f"AN ERROR OCCURRED: {e}")
+                await _send_ephemeral(interaction, f"Call [ERR-LV-028] AN ERROR OCCURRED: {e}")
 
 
 class HalfDayLeaveModal(Modal):
@@ -895,7 +1000,7 @@ class HalfDayLeaveModal(Modal):
             if not interaction.response.is_done():
                 await interaction.response.send_message(f"AN ERROR OCCURRED: {e}", ephemeral=True, delete_after=10)
             else:
-                await _send_ephemeral(interaction, f"AN ERROR OCCURRED: {e}")
+                await _send_ephemeral(interaction, f"Call [ERR-LV-029] AN ERROR OCCURRED: {e}")
 
 
 class OffDutyLeaveModal(Modal):
@@ -950,7 +1055,7 @@ class OffDutyLeaveModal(Modal):
             if not interaction.response.is_done():
                 await interaction.response.send_message(f"AN ERROR OCCURRED: {e}", ephemeral=True, delete_after=10)
             else:
-                await _send_ephemeral(interaction, f"AN ERROR OCCURRED: {e}")
+                await _send_ephemeral(interaction, f"Call [ERR-LV-030] AN ERROR OCCURRED: {e}")
 
 
 async def send_leave_application_to_approval_channel(interaction, leave_details, user_roles):
@@ -971,7 +1076,7 @@ async def send_leave_application_to_approval_channel(interaction, leave_details,
         if not interaction.response.is_done():
             await interaction.response.send_message(f"Error: approval channel {approval_ch_id} not found.", ephemeral=True, delete_after=10)
         else:
-            await _send_ephemeral(interaction, f"Error: approval channel {approval_ch_id} not found.")
+            await _send_ephemeral(interaction, f"Call [ERR-LV-031] Error: approval channel {approval_ch_id} not found.")
         return
 
     current_stage = 'first' if first_ch_id else 'hr'
@@ -1001,7 +1106,7 @@ async def send_leave_application_to_approval_channel(interaction, leave_details,
         dm_message = await user.send(embed=dm_embed, view=dm_view)
         dm_msg_id = dm_message.id
     except discord.Forbidden:
-        logging.warning(f"Could not send DM to user {interaction.user.display_name}")
+        logging.warning(f"[ERR-LV-032] Could not send DM to user {interaction.user.display_name}")
 
     # Append the DM ID to the footer so we can edit it later
     if dm_msg_id:
@@ -1015,7 +1120,7 @@ async def update_persistent_dm(bot, user_id, leave_details, next_stage, footer_t
     try:
         # Extract DM ID from footer
         if not footer_text or "DM ID: " not in footer_text:
-            logging.warning(f"[Leave] update_persistent_dm: no DM ID in footer for leave {leave_details.get('leave_id')}")
+            logging.warning(f"[ERR-LV-033] [Leave] update_persistent_dm: no DM ID in footer for leave {leave_details.get('leave_id')}")
             return
 
         dm_id_str = footer_text.split("DM ID: ")[1].split(" | ")[0].strip()
@@ -1028,7 +1133,7 @@ async def update_persistent_dm(bot, user_id, leave_details, next_stage, footer_t
         try:
             msg = await user.dm_channel.fetch_message(dm_id)
         except discord.NotFound:
-            logging.warning(f"[Leave] Persistent DM {dm_id} not found for user {user_id}. They may have deleted it.")
+            logging.warning(f"[ERR-LV-034] [Leave] Persistent DM {dm_id} not found for user {user_id}. They may have deleted it.")
             return
 
         date_display = leave_details.get('date_from', 'N/A')
@@ -1063,7 +1168,7 @@ async def update_persistent_dm(bot, user_id, leave_details, next_stage, footer_t
         await msg.edit(embed=embed, view=view)
 
     except Exception as e:
-        logging.error(f"[Leave] Error updating persistent DM for {user_id}: {e}")
+        logging.error(f"[ERR-LV-035] [Leave] Error updating persistent DM for {user_id}: {e}")
 
 
 # ─── Cog ─────────────────────────────────────────────────────────────────────
@@ -1075,18 +1180,33 @@ class LeaveCog(commands.Cog, name="Leave"):
         self.bot = bot
 
     async def cog_load(self):
-        """Start the DB worker and resolve channel/role config from discovery.db."""
-        resolve_leave_config()
-        asyncio.ensure_future(db.db_worker())
+        """Start the DB worker and initialize."""
+        self.bot.loop.create_task(db.db_worker())
+        await db.initialize_leave_db()
+        # Ensure the discovery event exists on the bot
+        if not hasattr(self.bot, 'discovery_complete'):
+            self.bot.discovery_complete = asyncio.Event()
 
     @commands.Cog.listener()
     async def on_ready(self):
-        guild = self.bot.guilds[0]
+        # Wait for DiscoveryCog to finish its initial sweep
+        logger.info("[Leave] Waiting for DiscoveryCog to complete initial sweep...")
+        await self.bot.discovery_complete.wait()
+        await resolve_leave_config()
+        
+        guild = self.bot.guilds[0] if self.bot.guilds else None
+        if not guild:
+            logger.warning("[ERR-LV-036] [Leave] No guilds found. Skipping member sync.")
+            return
+
         emp_role = guild.get_role(EMP_ROLE_ID)
         await db.create_dynamic_table()
-        for member in emp_role.members:
-            await db.create_user_table(member.display_name)
-            await db.insert_dynamic_user(member.display_name, member.id)
+        
+        if emp_role:
+            for member in emp_role.members:
+                await db.insert_dynamic_user(member.display_name, member.id)
+        else:
+            logger.warning(f"[ERR-LV-037] [Leave] Employee role (ID: {EMP_ROLE_ID}) not found in server. Skipping bulk member sync.")
 
         # Create base styled embed for Leave app logic
         leave_embed = discord.Embed(
@@ -1170,10 +1290,10 @@ class LeaveCog(commands.Cog, name="Leave"):
         try:
             export_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Database', 'Leave details'))
             os.makedirs(export_directory, exist_ok=True)
-            current_date = datetime.now().strftime("%d-%m-%Y")
+            current_date = datetime.now(IST).strftime("%d-%m-%Y")
             export_path = os.path.join(export_directory, f"leave_details_export_{current_date}.xlsx")
-            start_of_month = datetime.now().replace(day=1).strftime("%d-%m-%Y")
-            end_of_month = ((datetime.now().replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)).strftime("%d-%m-%Y")
+            start_of_month = datetime.now(IST).replace(day=1).strftime("%d-%m-%Y")
+            end_of_month = ((datetime.now(IST).replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)).strftime("%d-%m-%Y")
 
             tables = await db.get_all_tables()
             wb = Workbook()
@@ -1184,6 +1304,10 @@ class LeaveCog(commands.Cog, name="Leave"):
                 df = await db.fetch_table_data(table_name, start_of_month, end_of_month)
                 if df.empty:
                     continue
+                
+                # Make column headers human-readable (e.g. cancellation_reason -> Cancellation Reason)
+                df.columns = [str(col).replace('_', ' ').title() for col in df.columns]
+                
                 ws = wb.create_sheet(title=sheet_name)
                 for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=True), 1):
                     for c_idx, value in enumerate(row, 1):

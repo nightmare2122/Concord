@@ -147,7 +147,7 @@ get_footer_text(nickname, leave_id)         # → (footer_str,)
 update_footer_text(nickname, leave_id, text)
 
 # User queries
-fetch_dynamic_user(user_id)                 # → (last_leave, casual_bal, sick_bal)
+fetch_dynamic_user(user_id)                 # → dict {last_leave_taken, total_casual_leave, total_sick_leave}
 ```
 
 ---

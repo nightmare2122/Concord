@@ -22,20 +22,17 @@ Concord/
 ├── cogs/                    # Discord Cog modules (feature logic)
 │   ├── leave_cog.py         # Leave management (largest module)
 │   ├── task_cog.py          # Task management
-│   ├── dar_cog.py           # DAR reminders and role handling
-│   └── discovery_cog.py     # Server structure sync to SQLite
+│   ├── dar_cog.py           # DAR reporting and autonomous UI setup
+│   └── discovery_cog.py     # Server structure and message sync to SQLite
 │
 ├── Bots/
-│   ├── Leave.py             # Standalone leave bot (legacy)
-│   ├── Task.py              # Standalone task bot (legacy)
-│   ├── DAR.py               # Standalone DAR bot (legacy)
 │   └── db_managers/
 │       ├── discovery_db_manager.py  # discovery.db access layer
 │       ├── leave_db_manager.py      # leave.db access layer
 │       └── task_db_manager.py       # task.db access layer
 │
 └── Database/                # SQLite database files (auto-created)
-    ├── discovery.db         # Server structure mirror
+    ├── discovery.db         # Server structure and message mirror
     ├── leave.db             # Per-user leave records
     └── task.db              # Task records
 ```
@@ -55,8 +52,10 @@ run.sh
                       ├─ cogs.dar_cog
                       └─ cogs.discovery_cog
                            └─ on_ready()  # All cogs receive this event
-                                └─ Discovery sweep → populates discovery.db
+                                └─ Discovery sweep → populates discovery.db channels, roles, and scheduled events
+                                └─ Background Message Sweep → populates recent discord channel history asynchronously
                                 └─ Leave cog resolves channel/role IDs
+                                └─ DAR cog auto-deploys Submission UI to target channel
 ```
 
 Each cog has a `cog_load()` coroutine that Discord calls immediately after the cog is added. The discovery cog uses this to start its async DB worker queue.

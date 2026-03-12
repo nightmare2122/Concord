@@ -22,18 +22,19 @@ The project is built on a **Unified Cog System** using **discord.py**:
 ### 🧠 System Modules (`/cogs/`)
 | Module | Function |
 |---|---|
-| `discovery_cog.py` | **Dynamic Discovery**: Real-time mirroring of Discord server structure to local DB. |
+| `discovery_cog.py` | **Dynamic Discovery**: Real-time mirroring of Discord server structure and Message History to local DB. |
 | `leave_cog.py` | **Leave Pipeline**: 2-stage approval workflow (HOD → HR) with persistent DM status tracking. |
 | `task_cog.py` | **Task Management**: Assignment, prioritization, and lifecycle tracking. |
-| `dar_cog.py` | **Compliance Enforcement**: DAR submission tracking, role-based reset (11:00 AM), and automated reminders. |
+| `dar_cog.py` | **Compliance Enforcement**: DAR auto-panel deployment, Modal submission tracking, role-reset (11:00 AM), and automated reminders. |
 
 ---
 
 ## 🛰️ The Discovery System  
-Concord features a **Self-Healing Configuration** model. It eliminates hardcoded Discord IDs by maintaining a live mirror of categories, channels, roles, and members in `Database/discovery.db`.  
+Concord features a **Self-Healing Configuration** model. It eliminates hardcoded Discord IDs by maintaining a live mirror of categories, channels, roles, scheduled events, and messages in `Database/discovery.db`.  
 
 - **Runtime ID Resolution**: Channel renames or role adjustments in Discord are detected instantly.
 - **Dynamic Config**: Modules like `leave_cog` resolve their operational channels (e.g., `leave-hr`, `leave-pa`) from the database at startup.
+- **Auto-Deployment**: The bot actively queries the database on startup to identify missing operational channels (e.g. DAR tracking) and automatically injects UI forms into the Discord server if they were purged.
 
 ---
 
@@ -51,7 +52,7 @@ To set up the environment, install dependencies, and start the engine with a sin
    chmod +x run.sh
    ./run.sh
    ```
-*The script automatically manages virtual environment activation and dependency synchronization.*
+*The script automatically generates a real-time split-screen Dashboard in your terminal to view separated Cog logs cleanly without any clutter!*
 
 ---
 

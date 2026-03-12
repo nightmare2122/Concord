@@ -50,6 +50,25 @@ The discovery system maintains an **always-current mirror** of the Discord serve
 
 > **Note:** Roles are stored as a JSON array directly on the member row for simplicity. This avoids a join and supports fast LIKE-based lookups.
 
+### `messages`
+| Column | Type | Description |
+|---|---|---|
+| `id` | INTEGER PK | Discord message ID |
+| `channel_id` | INTEGER FK | ID of the channel |
+| `author_id` | INTEGER FK | ID of the author |
+| `content` | TEXT | Raw string content |
+| `created_at` | TEXT | ISO timestamp of the message UTC time |
+
+### `scheduled_events`
+| Column | Type | Description |
+|---|---|---|
+| `id` | INTEGER PK | Discord Event ID |
+| `name` | TEXT | Event title |
+| `description` | TEXT | Event string description |
+| `start_time` | TEXT | ISO Event timestamp |
+| `end_time` | TEXT | Nullable ISO Event end timestamp |
+| `status` | INTEGER | Active vs Invalid enum status |
+
 ---
 
 ## Async Queue Architecture
@@ -83,6 +102,8 @@ Runs once when the bot connects. Iterates all guild entities in order:
 2. Channels → `upsert_channel()`
 3. Roles → `upsert_role()`
 4. Members (via `fetch_members(limit=None)`) → `upsert_member()` **with roles**
+5. Scheduled Events → `upsert_scheduled_event()`
+6. **Background Sweeper**: Spawns an async queue `_sweep_messages()` which loops backwards through the top 50 messages of every text channel silently fetching missing cache data.
 
 ### Channel events
 | Discord Event | Action |
@@ -104,6 +125,14 @@ Runs once when the bot connects. Iterates all guild entities in order:
 | `on_member_join` | Upsert member (no roles yet) |
 | `on_member_update` | If roles or display_name changed → upsert with current roles |
 | `on_member_remove` | Delete member |
+
+### Message & Event events
+| Discord Event | Action |
+|---|---|
+| `on_message` | Upsert message payload |
+| `on_raw_message_edit` | Fetch active message ID and upsert with new content |
+| `on_raw_message_delete` | Delete message |
+| `on_scheduled_event_*` | Create, update, or remove Event ID records |
 
 ---
 

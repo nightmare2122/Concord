@@ -1,10 +1,9 @@
 import discord
 from discord.ext import commands
 import logging
-import sys, os
+import asyncio
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'Bots'))
-from db_managers import discovery_db_manager as db
+from Bots.db_managers import discovery_db_manager as db
 
 logger = logging.getLogger("Concord")
 
@@ -17,6 +16,10 @@ class DiscoveryCog(commands.Cog):
     async def cog_load(self):
         self.bg_task = self.bot.loop.create_task(db.db_worker())
         await db.initialize_discovery_db()
+        # Initialize the global discovery event
+        if not hasattr(self.bot, 'discovery_complete'):
+            self.bot.discovery_complete = asyncio.Event()
+        self.bot.discovery_complete.clear()
 
     async def cog_unload(self):
         if self.bg_task:
@@ -26,7 +29,7 @@ class DiscoveryCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        logger.info("[Discovery] Starting initial server analysis...")
+        logger.info("[Discovery] [Discovery] Starting initial server analysis...")
         for guild in self.bot.guilds:
             for category in guild.categories:
                 await db.upsert_category(category.id, category.name)
@@ -41,8 +44,39 @@ class DiscoveryCog(commands.Cog):
             async for member in guild.fetch_members(limit=None):
                 role_names = [r.name for r in member.roles if r.name != '@everyone']
                 await db.upsert_member(member.id, member.name, member.display_name, member.joined_at, roles=role_names)
+                await asyncio.sleep(0.01)
+
+            for event in guild.scheduled_events:
+                await db.upsert_scheduled_event(
+                    event.id, event.name, event.description,
+                    event.start_time, event.end_time, event.status.value
+                )
+
+        # Kick off async message sweeping so we don't block on_ready
+        self.bot.loop.create_task(self._sweep_messages())
 
         logger.info("[Discovery] Initial server discovery complete.")
+        self.bot.discovery_complete.set()
+
+    async def _sweep_messages(self):
+        """Asynchronously sweep recent messages to populate the database without blocking."""
+        logger.info("[Discovery] Starting background message sweep...")
+        for guild in self.bot.guilds:
+            for channel in guild.text_channels:
+                try:
+                    async for message in channel.history(limit=50):
+                        await db.upsert_message(
+                            message.id,
+                            message.channel.id,
+                            message.author.id,
+                            message.content,
+                            message.created_at
+                        )
+                except discord.Forbidden:
+                    logger.debug(f"[Discovery] Missing read permissions for #{channel.name}")
+                except Exception as e:
+                    logger.error(f"[ERR-DSC-001] [Discovery] Error sweeping #{channel.name}: {e}")
+        logger.info("[Discovery] Background message sweep complete.")
 
     # ─── Category Events ──────────────────────────────────────────────────────
 
@@ -128,6 +162,71 @@ class DiscoveryCog(commands.Cog):
         await db.delete_member(member.id)
         logger.info(f"[Discovery] Member left: {member.display_name} ({member.id})")
 
+    # ─── Message Events ───────────────────────────────────────────────────────
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        if message.guild is None:
+            return
+        await db.upsert_message(
+            message.id,
+            message.channel.id,
+            message.author.id,
+            message.content,
+            message.created_at
+        )
+
+    @commands.Cog.listener()
+    async def on_raw_message_edit(self, payload):
+        if payload.guild_id is None:
+            return
+        
+        try:
+            channel = self.bot.get_channel(payload.channel_id)
+            if not channel:
+                return
+            
+            # Using content if available in payload
+            content = payload.data.get('content')
+            if content is not None:
+                # To accurately update we need the full message, but if only content changed:
+                # Often it's safer to fetch the message
+                try:
+                    msg = await channel.fetch_message(payload.message_id)
+                    await db.upsert_message(
+                        msg.id,
+                        msg.channel.id,
+                        msg.author.id,
+                        msg.content,
+                        msg.created_at
+                    )
+                except discord.NotFound:
+                    pass
+        except Exception as e:
+            logger.error(f"[ERR-DSC-002] [Discovery] Error tracking edited message: {e}")
+
+    # ─── Scheduled Events ─────────────────────────────────────────────────────
+
+    @commands.Cog.listener()
+    async def on_scheduled_event_create(self, event):
+        await db.upsert_scheduled_event(
+            event.id, event.name, event.description,
+            event.start_time, event.end_time, event.status.value
+        )
+        logger.info(f"[Discovery] Scheduled Event created: {event.name}")
+
+    @commands.Cog.listener()
+    async def on_scheduled_event_update(self, before, after):
+        await db.upsert_scheduled_event(
+            after.id, after.name, after.description,
+            after.start_time, after.end_time, after.status.value
+        )
+        logger.info(f"[Discovery] Scheduled Event updated: {after.name}")
+
+    @commands.Cog.listener()
+    async def on_scheduled_event_delete(self, event):
+        await db.delete_scheduled_event(event.id)
+        logger.info(f"[Discovery] Scheduled Event deleted: {event.name}")
 
 async def setup(bot):
     await bot.add_cog(DiscoveryCog(bot))

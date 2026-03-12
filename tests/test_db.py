@@ -1,156 +1,129 @@
 """
 tests/test_db.py
-Task database manager unit tests using a temporary SQLite file.
+Task database manager unit tests mocking psycopg connection.
 """
 
 import pytest
-import sqlite3
 import sys
 import os
+import asyncio
+import inspect
+from unittest.mock import patch, MagicMock
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'Bots'))
-from db_managers import task_db_manager as db_manager
-from db_managers.task_db_manager import (
-    _store_task_in_database_sync,
-    _retrieve_task_from_database_sync,
-    _update_task_in_database_sync,
-    _delete_task_from_database_sync,
-    _retrieve_all_tasks_from_database_sync,
-    check_and_create_database,
-    store_pending_tasks_channel,
-    retrieve_pending_tasks_channel,
-    update_pending_tasks_channel,
-    _delete_pending_tasks_channel_from_database,
-)
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from Bots.db_managers import task_db_manager as db_manager
 
+# Make the queue worker run inline for easier testing
+async def mock_db_execute(func, *args, **kwargs):
+    if inspect.iscoroutinefunction(func):
+        return await func(*args, **kwargs)
+    return func(*args, **kwargs)
+
+@pytest.fixture(autouse=True)
+def patch_db_execute():
+    with patch('Bots.db_managers.task_db_manager.db_execute', side_effect=mock_db_execute):
+        yield
 
 @pytest.fixture
-def mock_db_path(monkeypatch, tmp_path):
-    """Route both DB paths to temporary files for each test."""
-    temp_db = tmp_path / "test_tasks.db"
-    monkeypatch.setattr(db_manager, "db_path", str(temp_db))
-    check_and_create_database()
-    return str(temp_db)
+def mock_conn():
+    with patch('Bots.db_managers.task_db_manager.get_conn') as get_conn_mock:
+        conn = MagicMock()
+        get_conn_mock.return_value.__enter__.return_value = conn
+        cur = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cur
+        yield conn, cur
 
-
-def make_task(**overrides):
+def make_db_row(**overrides):
     base = {
+        'task_id': 1,
         'channel_id': '12345',
-        'assignees': ['UserA', 'UserB'],
+        'assignees': 'UserA, UserB',
+        'assignee_ids': '1, 2',
         'details': 'Fix the bug',
         'deadline': '01/01/2026 12:00 PM',
         'temp_channel_link': 'http://discord.com/channels/1/2',
         'assigner': 'Boss',
+        'assigner_id': 999,
         'status': 'Pending',
         'title': 'Bug Fix',
+        'global_state': 'Active',
+        'completion_vector': '0,0',
+        'activity_log': '',
+        'reminders_sent': '',
+        'main_message_id': '5678',
+        'priority': 'Normal',
+        'acknowledged_by': '',
+        'blocker_reason': '',
+        'completed_at': None
     }
     base.update(overrides)
     return base
 
-
 # ─── Store & Retrieve ─────────────────────────────────────────────────────────
 
-def test_store_and_retrieve_task(mock_db_path):
-    """A stored task should be retrievable by channel_id."""
-    task = make_task()
-    _store_task_in_database_sync(task)
-    retrieved = _retrieve_task_from_database_sync('12345')
-    assert retrieved is not None
-    assert retrieved['title'] == 'Bug Fix'
-    assert len(retrieved['assignees']) == 2
+@pytest.mark.asyncio
+async def test_store_and_retrieve_task(mock_conn):
+    conn, cur = mock_conn
+    task = make_db_row()
+    task['assignees'] = ['UserA', 'UserB'] # Store gets Python object
+    
+    # Mock INSERT fetchone returning the new ID
+    cur.fetchone.return_value = {'task_id': 1}
+    
+    new_id = await db_manager.store_task_in_database(task)
+    assert new_id == 1
+    cur.execute.assert_called()
 
-def test_retrieve_nonexistent_task(mock_db_path):
-    """Retrieving a task that was never stored should return None."""
-    result = _retrieve_task_from_database_sync('00000')
-    assert result is None
+@pytest.mark.asyncio
+async def test_retrieve_task(mock_conn):
+    conn, cur = mock_conn
+    cur.fetchone.return_value = make_db_row(title='Retrieved', channel_id='999')
+    
+    res = await db_manager.retrieve_task_from_database(999)
+    assert res['title'] == 'Retrieved'
+    cur.execute.assert_called()
 
-def test_store_multiple_and_retrieve_all(mock_db_path):
-    """Multiple stored tasks should all be returned."""
-    _store_task_in_database_sync(make_task(channel_id='111', title='Task A'))
-    _store_task_in_database_sync(make_task(channel_id='222', title='Task B'))
-    tasks = _retrieve_all_tasks_from_database_sync()
-    assert len(tasks) == 2
-    titles = {t['title'] for t in tasks}
-    assert titles == {'Task A', 'Task B'}
+@pytest.mark.asyncio
+async def test_retrieve_all_tasks(mock_conn):
+    conn, cur = mock_conn
+    cur.fetchall.return_value = [make_db_row(title='Task A'), make_db_row(title='Task B')]
+    
+    res = await db_manager.retrieve_all_tasks_from_database()
+    assert len(res) == 2
+    assert res[1]['title'] == 'Task B'
 
-def test_retrieve_all_tasks_empty(mock_db_path):
-    """An empty database should return an empty list."""
-    tasks = _retrieve_all_tasks_from_database_sync()
-    assert tasks == []
+# ─── Update & Delete ──────────────────────────────────────────────────────────
 
+@pytest.mark.asyncio
+async def test_update_task(mock_conn):
+    conn, cur = mock_conn
+    task = make_db_row(task_id=1, status='Completed')
+    task['assignees'] = ['UserA', 'UserB']
+    
+    await db_manager.update_task_in_database(task)
+    cur.execute.assert_called()
+    conn.commit.assert_called()
 
-# ─── Update ───────────────────────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_delete_task(mock_conn):
+    conn, cur = mock_conn
+    await db_manager.delete_task_from_database(555)
+    cur.execute.assert_called_with('DELETE FROM tasks WHERE channel_id = %s', (555,))
+    conn.commit.assert_called()
 
-def test_update_task_status(mock_db_path):
-    """Updating a task's status should persist the new value."""
-    task = make_task(channel_id='333', status='Pending')
-    _store_task_in_database_sync(task)
+# ─── Channels ─────────────────────────────────────────────────────────────────
 
-    task['status'] = 'Completed by Assignee'
-    _update_task_in_database_sync(task)
+@pytest.mark.asyncio
+async def test_pending_tasks_channel(mock_conn):
+    conn, cur = mock_conn
+    cur.fetchone.return_value = {'channel_id': '888', 'tasks': '1,2', 'task_message_ids': '3,4'}
+    
+    res = await db_manager.retrieve_pending_tasks_channel(123)
+    assert res['channel_id'] == '888'
 
-    updated = _retrieve_task_from_database_sync('333')
-    assert updated['status'] == 'Completed by Assignee'
-
-def test_update_task_deadline(mock_db_path):
-    """Updating a task's deadline should persist the new value."""
-    task = make_task(channel_id='444', deadline='10/01/2026 09:00 AM')
-    _store_task_in_database_sync(task)
-
-    task['deadline'] = '20/01/2026 05:00 PM'
-    _update_task_in_database_sync(task)
-
-    updated = _retrieve_task_from_database_sync('444')
-    assert updated['deadline'] == '20/01/2026 05:00 PM'
-
-
-# ─── Delete ───────────────────────────────────────────────────────────────────
-
-def test_delete_task(mock_db_path):
-    """Deleting a task by channel_id should remove it from the database."""
-    task = make_task(channel_id='555')
-    _store_task_in_database_sync(task)
-    _delete_task_from_database_sync('555')
-    result = _retrieve_task_from_database_sync('555')
-    assert result is None
-
-def test_delete_nonexistent_task_does_not_error(mock_db_path):
-    """Deleting a task that doesn't exist should not raise an exception."""
-    _delete_task_from_database_sync('99999')  # Should be a no-op
-
-
-# ─── Pending tasks channel management ────────────────────────────────────────
-
-def test_store_and_retrieve_pending_tasks_channel(mock_db_path):
-    """Storing a pending tasks channel should be retrievable for that user."""
-    user_id = 1001
-    channel_id = 2001
-    store_pending_tasks_channel(user_id, channel_id)
-    cid, task_ids, msg_ids = retrieve_pending_tasks_channel(user_id)
-    assert cid == channel_id
-    assert task_ids == []
-    assert msg_ids == []
-
-def test_update_pending_tasks_channel(mock_db_path):
-    """Updating task/message ID lists should persist correctly."""
-    user_id = 1002
-    channel_id = 2002
-    store_pending_tasks_channel(user_id, channel_id)
-    update_pending_tasks_channel(user_id, ['t1', 't2'], ['m1', 'm2'])
-    cid, task_ids, msg_ids = retrieve_pending_tasks_channel(user_id)
-    assert task_ids == ['t1', 't2']
-    assert msg_ids == ['m1', 'm2']
-
-def test_delete_pending_tasks_channel(mock_db_path):
-    """Deleting a pending tasks channel record should remove it."""
-    user_id = 1003
-    channel_id = 2003
-    store_pending_tasks_channel(user_id, channel_id)
-    _delete_pending_tasks_channel_from_database(user_id)
-    cid, task_ids, msg_ids = retrieve_pending_tasks_channel(user_id)
-    assert cid is None
-
-def test_retrieve_pending_tasks_channel_not_found(mock_db_path):
-    """Retrieving for a user with no stored channel returns None."""
-    cid, task_ids, msg_ids = retrieve_pending_tasks_channel(9999)
-    assert cid is None
+@pytest.mark.asyncio
+async def test_store_pending_tasks_channel(mock_conn):
+    conn, cur = mock_conn
+    await db_manager.store_pending_tasks_channel(123, 456)
+    cur.execute.assert_called()
+    conn.commit.assert_called()

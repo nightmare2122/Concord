@@ -1,249 +1,119 @@
 """
 tests/test_leave_db.py
-Leave database manager unit tests using temporary SQLite files.
+Leave database manager unit tests mocking psycopg connection.
 """
 
 import pytest
-import sqlite3
-import os
 import sys
-from unittest.mock import patch
+import os
+import asyncio
+import inspect
+from unittest.mock import patch, MagicMock
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'Bots'))
-from db_managers import leave_db_manager as db
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from Bots.db_managers import leave_db_manager as db_manager
 
+# Make the queue worker run inline for easier testing
+async def mock_db_execute(func, *args, **kwargs):
+    if inspect.iscoroutinefunction(func):
+        return await func(*args, **kwargs)
+    return func(*args, **kwargs)
+
+@pytest.fixture(autouse=True)
+def patch_db_execute():
+    with patch('Bots.db_managers.leave_db_manager.db_execute', side_effect=mock_db_execute):
+        yield
 
 @pytest.fixture
-def mock_dbs(tmp_path):
-    """Create isolated temporary leave and dynamic update databases per test."""
-    test_leave_db = tmp_path / "test_leave_details.db"
-    test_dyn_db = tmp_path / "test_dynamic_updates.db"
-
-    with patch('db_managers.leave_db_manager.db_leave_details_path', str(test_leave_db)), \
-         patch('db_managers.leave_db_manager.db_dynamic_updates_path', str(test_dyn_db)):
-        yield test_leave_db, test_dyn_db
-
-
-# ─── Table creation / deletion ────────────────────────────────────────────────
-
-def test_create_and_delete_user_table(mock_dbs):
-    nickname = "TestUser!@#"
-    sanitized = db.sanitize_table_name(nickname)
-
-    db._create_user_table_sync(nickname)
-    assert sanitized in db.get_all_tables_sync()
-
-    db._delete_user_table_sync(nickname)
-    assert sanitized not in db.get_all_tables_sync()
-
-def test_create_user_table_idempotent(mock_dbs):
-    """Creating the same user table twice should not raise an error."""
-    db._create_user_table_sync("Alice")
-    db._create_user_table_sync("Alice")  # Second call should be harmless
-    assert db.sanitize_table_name("Alice") in db.get_all_tables_sync()
-
-def test_sanitize_table_name_strips_special_chars():
-    """sanitize_table_name should replace non-alphanumeric characters with underscores."""
-    result = db.sanitize_table_name("Hello World #123!")
-    assert " " not in result
-    assert "#" not in result
-    assert "!" not in result
+def mock_conn():
+    with patch('Bots.db_managers.leave_db_manager.get_conn') as get_conn_mock:
+        conn = MagicMock()
+        get_conn_mock.return_value.__enter__.return_value = conn
+        cur = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cur
+        yield conn, cur
 
 
-# ─── Dynamic user management ──────────────────────────────────────────────────
+# ─── Dynamic User Creation ────────────────────────────────────────────────────
 
-def test_dynamic_user_management(mock_dbs):
-    """Insert a dynamic user and verify default values, then delete."""
-    nickname = "JaneDoe"
-    user_id = 12345
-    db._create_dynamic_table_sync()
+@pytest.mark.asyncio
+async def test_insert_dynamic_user(mock_conn):
+    conn, cur = mock_conn
+    # Used to test insert_dynamic_user directly instead of non-existent ensure_user_exists
+    cur.fetchone.return_value = None
+    
+    await db_manager.insert_dynamic_user('testuser', 123456789)
+    cur.execute.assert_called()
+    conn.commit.assert_called()
 
-    with db.get_dynamic_conn() as conn:
-        conn.execute(
-            'INSERT OR IGNORE INTO dynamic_updates (nickname, user_id) VALUES (?, ?)',
-            (nickname, user_id)
-        )
+# ─── Leave Insertion & Balances ───────────────────────────────────────────────
 
-    with db.get_dynamic_conn() as conn:
-        result = conn.execute(
-            'SELECT last_leave_taken, total_casual_leave, total_sick_leave FROM dynamic_updates WHERE user_id = ?',
-            (user_id,)
-        ).fetchone()
+@pytest.mark.asyncio
+async def test_submit_leave_application(mock_conn):
+    conn, cur = mock_conn
+    cur.fetchone.return_value = {'id': 42}
+    
+    leave_details = {
+        'leave_type': 'FULL DAY',
+        'start_date': '2026-03-10',
+        'end_date': '2026-03-11',
+        'duration': '2',
+        'holidays': '0',
+        'return_date': '2026-03-12',
+        'reason': 'Feeling unwell'
+    }
+    
+    # Needs to match the 9 values expected by FULL DAY insert:
+    data = (
+        leave_details['leave_type'],
+        leave_details['reason'],
+        leave_details['start_date'],
+        leave_details['end_date'],
+        leave_details['duration'],
+        leave_details['return_date'],
+        'N/A',
+        'Pending',
+        ''
+    )
+    
+    # submit_leave_application returns leave_id explicitly
+    leave_id = await db_manager.submit_leave_application(
+        nickname='testuser',
+        leave_details=leave_details,
+        data=data,
+        user_id=123456789
+    )
+    
+    assert leave_id == 42
+    cur.execute.assert_called()
 
-    assert result == (None, 0.0, 0.0)
+@pytest.mark.asyncio
+async def test_reduce_leave_balance(mock_conn):
+    conn, cur = mock_conn
+    cur.fetchone.return_value = {'casual': 12.0}
+    
+    await db_manager.reduce_leave_balance(123456789, 'casual', 2.0)
+    cur.execute.assert_called()
+    conn.commit.assert_called()
 
-    with db.get_dynamic_conn() as conn:
-        conn.execute('DELETE FROM dynamic_updates WHERE user_id = ?', (user_id,))
-        gone = conn.execute('SELECT * FROM dynamic_updates WHERE user_id = ?', (user_id,)).fetchone()
-    assert gone is None
+# ─── Approval & Status ────────────────────────────────────────────────────────
 
-def test_dynamic_table_duplicate_insert_ignored(mock_dbs):
-    """INSERT OR IGNORE should not raise on duplicate user_id."""
-    db._create_dynamic_table_sync()
-    with db.get_dynamic_conn() as conn:
-        conn.execute('INSERT OR IGNORE INTO dynamic_updates (nickname, user_id) VALUES (?, ?)', ("Dup", 111))
-        conn.execute('INSERT OR IGNORE INTO dynamic_updates (nickname, user_id) VALUES (?, ?)', ("Dup", 111))
-        count = conn.execute('SELECT COUNT(*) FROM dynamic_updates WHERE user_id = 111').fetchone()[0]
-    assert count == 1
+@pytest.mark.asyncio
+async def test_update_approval(mock_conn):
+    conn, cur = mock_conn
+    await db_manager.update_approval('testuser', 42, 'Director')
+    cur.execute.assert_called_with(
+        "UPDATE leaves SET approved_by = %s WHERE id = %s",
+        ('Director', 42)
+    )
+    conn.commit.assert_called()
 
-
-# ─── Leave insertion, approval, and balance update ────────────────────────────
-
-def test_full_leave_insertion_and_approval(mock_dbs):
-    nickname = "JohnSmith"
-    user_id = 999
-    table_name = db.sanitize_table_name(nickname)
-
-    db._create_user_table_sync(nickname)
-    db._create_dynamic_table_sync()
-
-    with db.get_dynamic_conn() as conn:
-        conn.execute('INSERT INTO dynamic_updates (nickname, user_id) VALUES (?, ?)', (nickname, user_id))
-
-    data = ("FULL DAY", "SICK", "01-01-2026", "03-01-2026", 3.0, "04-01-2026", None, "PENDING", None)
-    with db.get_leave_conn() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            f'INSERT INTO {table_name} (leave_type, leave_reason, date_from, date_to, number_of_days_off, resume_office_on, time_off, leave_status, reason_for_decline) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            data
-        )
-        leave_id = cursor.lastrowid
-    assert leave_id == 1
-
-    # Approve and update balances
-    with db.get_leave_conn() as conn:
-        conn.execute(f"UPDATE {table_name} SET leave_status = 'Accepted' WHERE leave_id = ?", (leave_id,))
-    with db.get_dynamic_conn() as conn:
-        conn.execute(
-            "UPDATE dynamic_updates SET total_sick_leave = total_sick_leave + ?, last_leave_taken = ? WHERE user_id = ?",
-            (3.0, "03-01-2026", user_id)
-        )
-
-    with db.get_leave_conn() as conn:
-        row = conn.execute(
-            f"SELECT leave_reason, number_of_days_off FROM {table_name} WHERE leave_id = ? AND leave_status = 'Accepted'",
-            (leave_id,)
-        ).fetchone()
-    assert row == ("SICK", 3.0)
-
-    with db.get_dynamic_conn() as conn:
-        dyn = conn.execute(
-            'SELECT last_leave_taken, total_casual_leave, total_sick_leave FROM dynamic_updates WHERE user_id = ?',
-            (user_id,)
-        ).fetchone()
-    assert dyn[2] == 3.0   # sick leave deducted
-    assert dyn[0] == "03-01-2026"
-
-
-def test_casual_leave_balance_update(mock_dbs):
-    """Approving a casual leave should deduct from total_casual_leave."""
-    nickname = "CasualUser"
-    user_id = 888
-    table_name = db.sanitize_table_name(nickname)
-
-    db._create_user_table_sync(nickname)
-    db._create_dynamic_table_sync()
-
-    with db.get_dynamic_conn() as conn:
-        conn.execute('INSERT INTO dynamic_updates (nickname, user_id) VALUES (?, ?)', (nickname, user_id))
-
-    with db.get_leave_conn() as conn:
-        conn.execute(
-            f'INSERT INTO {table_name} (leave_type, leave_reason, date_from, date_to, number_of_days_off, resume_office_on, time_off, leave_status, reason_for_decline) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            ("HALF DAY", "CASUAL", "14-03-2026", None, 0.5, None, "FORENOON", "PENDING", None)
-        )
-        leave_id = conn.execute(f"SELECT last_insert_rowid()").fetchone()[0]
-
-    with db.get_leave_conn() as conn:
-        conn.execute(f"UPDATE {table_name} SET leave_status = 'Accepted' WHERE leave_id = ?", (leave_id,))
-    with db.get_dynamic_conn() as conn:
-        conn.execute(
-            "UPDATE dynamic_updates SET total_casual_leave = total_casual_leave + ? WHERE user_id = ?",
-            (0.5, user_id)
-        )
-
-    with db.get_dynamic_conn() as conn:
-        row = conn.execute('SELECT total_casual_leave FROM dynamic_updates WHERE user_id = ?', (user_id,)).fetchone()
-    assert row[0] == 0.5
-
-
-def test_decline_leave_status(mock_dbs):
-    """Declining a leave should mark it as Declined, not Accepted."""
-    nickname = "DeclineUser"
-    user_id = 777
-    table_name = db.sanitize_table_name(nickname)
-    db._create_user_table_sync(nickname)
-    db._create_dynamic_table_sync()
-
-    with db.get_dynamic_conn() as conn:
-        conn.execute('INSERT INTO dynamic_updates (nickname, user_id) VALUES (?, ?)', (nickname, user_id))
-    with db.get_leave_conn() as conn:
-        conn.execute(
-            f'INSERT INTO {table_name} (leave_type, leave_reason, date_from, date_to, number_of_days_off, resume_office_on, time_off, leave_status, reason_for_decline) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            ("FULL DAY", "CASUAL", "15-03-2026", "15-03-2026", 1.0, "16-03-2026", None, "PENDING", None)
-        )
-        leave_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-    # Decline it
-    with db.get_leave_conn() as conn:
-        conn.execute(
-            f"UPDATE {table_name} SET leave_status = 'Declined', reason_for_decline = ? WHERE leave_id = ?",
-            ("Insufficient notice", leave_id)
-        )
-
-    with db.get_leave_conn() as conn:
-        row = conn.execute(f"SELECT leave_status, reason_for_decline FROM {table_name} WHERE leave_id = ?", (leave_id,)).fetchone()
-    assert row[0] == 'Declined'
-    assert row[1] == "Insufficient notice"
-
-
-def test_multiple_leaves_per_user(mock_dbs):
-    """A user can have multiple leave records with sequential IDs."""
-    nickname = "MultiLeave"
-    user_id = 555
-    table_name = db.sanitize_table_name(nickname)
-    db._create_user_table_sync(nickname)
-    db._create_dynamic_table_sync()
-
-    with db.get_dynamic_conn() as conn:
-        conn.execute('INSERT INTO dynamic_updates (nickname, user_id) VALUES (?, ?)', (nickname, user_id))
-
-    with db.get_leave_conn() as conn:
-        for i in range(3):
-            conn.execute(
-                f'INSERT INTO {table_name} (leave_type, leave_reason, date_from, date_to, number_of_days_off, resume_office_on, time_off, leave_status, reason_for_decline) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                ("FULL DAY", "SICK", f"0{i+1}-04-2026", f"0{i+1}-04-2026", 1.0, f"0{i+2}-04-2026", None, "PENDING", None)
-            )
-        count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
-    assert count == 3
-
-
-def test_withdraw_reverts_leave_status(mock_dbs):
-    """Withdrawing a leave should change its status away from Accepted."""
-    nickname = "WithdrawUser"
-    user_id = 444
-    table_name = db.sanitize_table_name(nickname)
-    db._create_user_table_sync(nickname)
-    db._create_dynamic_table_sync()
-
-    with db.get_dynamic_conn() as conn:
-        conn.execute('INSERT INTO dynamic_updates (nickname, user_id) VALUES (?, ?)', (nickname, user_id))
-    with db.get_leave_conn() as conn:
-        conn.execute(
-            f'INSERT INTO {table_name} (leave_type, leave_reason, date_from, date_to, number_of_days_off, resume_office_on, time_off, leave_status, reason_for_decline) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            ("FULL DAY", "CASUAL", "10-05-2026", "10-05-2026", 1.0, "11-05-2026", None, "Accepted", None)
-        )
-        leave_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-    # Withdraw: set status to Withdrawn and revert the casual leave balance
-    with db.get_leave_conn() as conn:
-        conn.execute(f"UPDATE {table_name} SET leave_status = 'Withdrawn' WHERE leave_id = ?", (leave_id,))
-    with db.get_dynamic_conn() as conn:
-        conn.execute(
-            "UPDATE dynamic_updates SET total_casual_leave = total_casual_leave - ? WHERE user_id = ?",
-            (1.0, user_id)
-        )
-
-    with db.get_leave_conn() as conn:
-        status = conn.execute(f"SELECT leave_status FROM {table_name} WHERE leave_id = ?", (leave_id,)).fetchone()[0]
-    assert status == 'Withdrawn'
+@pytest.mark.asyncio
+async def test_confirm_withdraw_leave(mock_conn):
+    conn, cur = mock_conn
+    await db_manager.confirm_withdraw_leave('testuser', 42)
+    cur.execute.assert_called_with(
+        "UPDATE leaves SET leave_status = 'Withdrawn by HR' WHERE id = %s",
+        (42,)
+    )
+    conn.commit.assert_called()

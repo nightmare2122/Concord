@@ -6,3 +6,4 @@ openpyxl
 pytest
 pytest-asyncio
 psycopg[binary]
+psycopg-pool

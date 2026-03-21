@@ -26,9 +26,10 @@ def patch_db_execute():
 
 @pytest.fixture
 def mock_conn():
-    with patch('Bots.db_managers.task_db_manager.get_conn') as get_conn_mock:
+    with patch('Bots.db_managers.task_db_manager.get_conn') as get_conn_mock, \
+         patch('Bots.db_managers.task_db_manager.put_conn'):
         conn = MagicMock()
-        get_conn_mock.return_value.__enter__.return_value = conn
+        get_conn_mock.return_value = conn
         cur = MagicMock()
         conn.cursor.return_value.__enter__.return_value = cur
         yield conn, cur
@@ -54,7 +55,9 @@ def make_db_row(**overrides):
         'priority': 'Normal',
         'acknowledged_by': '',
         'blocker_reason': '',
-        'completed_at': None
+        'completed_at': None,
+        'checklist': '',
+        'created_at': None
     }
     base.update(overrides)
     return base

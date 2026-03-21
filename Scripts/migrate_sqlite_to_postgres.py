@@ -11,8 +11,14 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Migration")
 
-# SQLite Paths
-sqlite_db_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), 'Database'))
+import sys
+# Add project root to sys.path for imports
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# SQLite Paths - resolved relative to project root
+sqlite_db_dir = os.path.join(PROJECT_ROOT, 'Database')
 db_discovery_path = os.path.join(sqlite_db_dir, 'discovery.db')
 db_leave_details_path = os.path.join(sqlite_db_dir, 'leave_details.db')
 db_dynamic_updates_path = os.path.join(sqlite_db_dir, 'dynamic_updates.db')

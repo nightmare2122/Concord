@@ -7,7 +7,7 @@ PROPRIETARY AND CONFIDENTIAL.
 import re
 import logging
 
-from .base_db import get_conn, db_queue, db_worker, db_execute  # noqa: F401
+from .base_db import get_conn, put_conn, get_connection, db_queue, db_worker, db_execute  # noqa: F401
 
 logger = logging.getLogger("Concord")
 
@@ -15,7 +15,8 @@ logger = logging.getLogger("Concord")
 
 async def initialize_leave_db():
     def _init():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute('''
                     CREATE TABLE IF NOT EXISTS users (
@@ -57,6 +58,8 @@ async def initialize_leave_db():
                     )
                 ''')
             conn.commit()
+        finally:
+            put_conn(conn)
     await db_execute(_init)
 
 # ─── Holiday Helpers ──────────────────────────────────────────────────────────
@@ -64,26 +67,24 @@ async def initialize_leave_db():
 async def is_holiday(date_str):
     """Check if a date (DD-MM-YYYY) falls on a national holiday."""
     def _check():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1 FROM holidays WHERE date = %s", (date_str,))
                 return cur.fetchone() is not None
+        finally:
+            put_conn(conn)
     return await db_execute(_check)
 
 # ─── Core Database Methods ────────────────────────────────────────────────────
-
-async def create_user_table(nickname):
-    pass
-
-async def delete_user_table(nickname):
-    pass
 
 async def create_dynamic_table():
     await initialize_leave_db()
 
 async def insert_dynamic_user(nickname, user_id):
     def _insert():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute('''
                     INSERT INTO users (user_id, nickname)
@@ -91,31 +92,40 @@ async def insert_dynamic_user(nickname, user_id):
                     ON CONFLICT (user_id) DO UPDATE SET nickname = EXCLUDED.nickname
                 ''', (user_id, nickname))
             conn.commit()
+        finally:
+            put_conn(conn)
     await db_execute(_insert)
 
 async def remove_dynamic_user(user_id):
     def _delete():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute('DELETE FROM users WHERE user_id = %s', (user_id,))
             conn.commit()
+        finally:
+            put_conn(conn)
     await db_execute(_delete)
 
 async def fetch_dynamic_user(user_id):
     def _fetch():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute('''
-                    SELECT last_leave_taken, total_casual_leave, total_sick_leave
+                    SELECT last_leave_taken, total_casual_leave, total_sick_leave, total_c_off, off_duty_hours
                     FROM users
                     WHERE user_id = %s
                 ''', (user_id,))
                 return cur.fetchone()
+        finally:
+            put_conn(conn)
     return await db_execute(_fetch)
 
 async def get_leave_status(nickname, leave_id):
     def _get():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute('''
                     SELECT leave_reason, number_of_days_off 
@@ -124,19 +134,25 @@ async def get_leave_status(nickname, leave_id):
                 ''', (leave_id,))
                 result = cur.fetchone()
                 return result if result else None
+        finally:
+            put_conn(conn)
     return await db_execute(_get)
 
 async def get_leave_full_details(nickname, leave_id):
     def _get():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute("SELECT * FROM leaves WHERE id = %s", (leave_id,))
                 return cur.fetchone()
+        finally:
+            put_conn(conn)
     return await db_execute(_get)
 
 async def get_pending_leave_status(nickname, leave_id):
     def _get():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute('''
                     SELECT leave_reason, number_of_days_off 
@@ -145,20 +161,26 @@ async def get_pending_leave_status(nickname, leave_id):
                 ''', (leave_id,))
                 result = cur.fetchone()
                 return result if result else None
+        finally:
+            put_conn(conn)
     return await db_execute(_get)
 
 async def check_leave_owner(nickname):
     def _check():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute('SELECT user_id FROM users WHERE nickname = %s', (nickname,))
                 result = cur.fetchone()
                 return result if result else None
+        finally:
+            put_conn(conn)
     return await db_execute(_check)
 
 async def withdraw_leave(nickname, leave_id, cancelled_by=None, cancellation_reason=None):
     def _withdraw():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute('''
                     UPDATE leaves 
@@ -168,11 +190,14 @@ async def withdraw_leave(nickname, leave_id, cancelled_by=None, cancellation_rea
                     WHERE id = %s
                 ''', (cancelled_by, cancellation_reason, leave_id))
             conn.commit()
+        finally:
+            put_conn(conn)
     await db_execute(_withdraw)
 
 async def request_withdraw_leave(nickname, leave_id, requested_by=None, reason=None):
     def _request_withdraw():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute('''
                     UPDATE leaves 
@@ -182,27 +207,36 @@ async def request_withdraw_leave(nickname, leave_id, requested_by=None, reason=N
                     WHERE id = %s
                 ''', (requested_by, reason, leave_id))
             conn.commit()
+        finally:
+            put_conn(conn)
     await db_execute(_request_withdraw)
 
 async def confirm_withdraw_leave(nickname, leave_id):
     def _confirm_withdraw():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute("UPDATE leaves SET leave_status = 'Withdrawn by HR' WHERE id = %s", (leave_id,))
             conn.commit()
+        finally:
+            put_conn(conn)
     await db_execute(_confirm_withdraw)
 
 async def revert_cancellation_request(nickname, leave_id):
     def _revert():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute("UPDATE leaves SET leave_status = 'Accepted' WHERE id = %s", (leave_id,))
             conn.commit()
+        finally:
+            put_conn(conn)
     await db_execute(_revert)
 
 async def reduce_leave_balance(user_id, leave_reason, amount):
     def _reduce():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 if leave_reason == "sick":
                     cur.execute("UPDATE users SET total_sick_leave = total_sick_leave - %s WHERE user_id = %s", (amount, user_id))
@@ -211,11 +245,14 @@ async def reduce_leave_balance(user_id, leave_reason, amount):
                 elif leave_reason == "c. off":
                     cur.execute("UPDATE users SET total_c_off = total_c_off - %s WHERE user_id = %s", (amount, user_id))
             conn.commit()
+        finally:
+            put_conn(conn)
     return await db_execute(_reduce)
 
 async def refund_leave_balance(user_id, leave_reason, amount):
     def _refund():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 if leave_reason == "sick":
                     cur.execute("UPDATE users SET total_sick_leave = total_sick_leave + %s WHERE user_id = %s", (amount, user_id))
@@ -224,11 +261,14 @@ async def refund_leave_balance(user_id, leave_reason, amount):
                 elif leave_reason == "c. off":
                     cur.execute("UPDATE users SET total_c_off = total_c_off + %s WHERE user_id = %s", (amount, user_id))
             conn.commit()
+        finally:
+            put_conn(conn)
     return await db_execute(_refund)
 
 async def update_last_leave_date_after_withdrawal(nickname, user_id):
     def _update():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute("SELECT MAX(date_to) FROM leaves WHERE user_id = %s AND leave_status = 'Accepted'", (user_id,))
                 latest_date_row = cur.fetchone()
@@ -236,14 +276,19 @@ async def update_last_leave_date_after_withdrawal(nickname, user_id):
                 if latest_date:
                     cur.execute("UPDATE users SET last_leave_taken = %s WHERE user_id = %s", (latest_date, user_id))
             conn.commit()
+        finally:
+            put_conn(conn)
     return await db_execute(_update)
 
 async def update_footer_text(nickname, leave_id, footer_text):
     def _update():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute("UPDATE leaves SET footer_text = %s WHERE id = %s", (footer_text, leave_id))
             conn.commit()
+        finally:
+            put_conn(conn)
     await db_execute(_update)
 
 async def submit_leave_application(nickname, leave_details, data, user_id=None):
@@ -256,7 +301,8 @@ async def submit_leave_application(nickname, leave_details, data, user_id=None):
 
     def _insert():
         leave_type = leave_details.get('leave_type', '')
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 if leave_type == 'FULL DAY':
                     cur.execute('''
@@ -276,20 +322,28 @@ async def submit_leave_application(nickname, leave_details, data, user_id=None):
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         RETURNING id
                     ''', (user_id, *data))
-                return cur.fetchone()['id']
+                new_id = cur.fetchone()['id']
+            conn.commit()
+            return new_id
+        finally:
+            put_conn(conn)
     return await db_execute(_insert)
 
 async def add_off_duty_hours(user_id, cumulated_hours):
     def _update():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute("UPDATE users SET off_duty_hours = off_duty_hours + %s WHERE user_id = %s", (cumulated_hours, user_id))
             conn.commit()
+        finally:
+            put_conn(conn)
     await db_execute(_update)
 
 async def confirm_leave_acceptance(nickname, leave_id, leave_reason, number_of_days_off, date_to, user_id):
     def _accept():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute("UPDATE leaves SET leave_status = 'Accepted' WHERE id = %s", (leave_id,))
                 if leave_reason == "sick":
@@ -299,45 +353,69 @@ async def confirm_leave_acceptance(nickname, leave_id, leave_reason, number_of_d
                 elif leave_reason == "c. off":
                     cur.execute("UPDATE users SET total_c_off = total_c_off + %s, last_leave_taken = %s WHERE user_id = %s", (number_of_days_off, date_to, user_id))
             conn.commit()
+        finally:
+            put_conn(conn)
     await db_execute(_accept)
 
 async def update_approval(nickname, leave_id, approved_by):
     def _approve():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute("UPDATE leaves SET approved_by = %s WHERE id = %s", (approved_by, leave_id))
             conn.commit()
+        finally:
+            put_conn(conn)
     await db_execute(_approve)
 
 async def get_footer_text(nickname, leave_id):
     def _fetch():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute("SELECT footer_text FROM leaves WHERE id = %s", (leave_id,))
                 result = cur.fetchone()
                 return result if result else None
+        finally:
+            put_conn(conn)
     return await db_execute(_fetch)
 
 # ─── Data Export Helpers ──────────────────────────────────────────────────────
 
 async def get_all_users():
     def _fetch():
-        with get_conn() as conn:
+        conn = get_conn()
+        try:
             with conn.cursor() as cur:
                 cur.execute("SELECT nickname FROM users")
                 return [r['nickname'] for r in cur.fetchall()]
+        finally:
+            put_conn(conn)
     return await db_execute(_fetch)
 
 async def fetch_user_leave_data(nickname, start_of_month, end_of_month):
+    """
+    Returns a list of dicts for accepted/withdrawn leave records in the given date range.
+    start_of_month / end_of_month: Python date objects or ISO strings (YYYY-MM-DD).
+    Dates stored in the DB as DD-MM-YYYY text — TO_DATE() handles the conversion.
+    """
     def _fetch():
-        import pandas as pd
-        query = """
-            SELECT l.* FROM leaves l
-            JOIN users u ON l.user_id = u.user_id
-            WHERE u.nickname = %s
-            AND (l.leave_status = 'Accepted' OR l.leave_status = 'Withdrawn')
-            AND (l.date_from >= %s AND (l.date_to <= %s OR l.date_to IS NULL))
-        """
-        with get_conn() as conn:
-            return pd.read_sql_query(query, conn, params=(nickname, start_of_month, end_of_month))
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT l.* FROM leaves l
+                    JOIN users u ON l.user_id = u.user_id
+                    WHERE u.nickname = %s
+                      AND l.leave_status IN ('Accepted', 'Withdrawn')
+                      AND TO_DATE(l.date_from, 'DD-MM-YYYY') >= %s
+                      AND (
+                          l.date_to IS NULL
+                          OR TO_DATE(l.date_to, 'DD-MM-YYYY') <= %s
+                      )
+                    ORDER BY TO_DATE(l.date_from, 'DD-MM-YYYY')
+                """, (nickname, start_of_month, end_of_month))
+                return [dict(row) for row in cur.fetchall()]
+        finally:
+            put_conn(conn)
     return await db_execute(_fetch)

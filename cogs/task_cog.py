@@ -5,17 +5,18 @@ PROPRIETARY AND CONFIDENTIAL.
 """
 
 import asyncio
+import difflib
 import logging
+import os
 import discord
 from discord import ui
 from discord.ext import commands
-import difflib
-import os
-import ast
 from datetime import datetime, timedelta, timezone
 
+logger = logging.getLogger("Concord")
+
 # IST Timezone — single source of truth
-from Bots.utils.timezone import IST, now_ist
+from Bots.utils.timezone import IST, now_ist, parse_datetime_flexible
 
 from Bots.db_managers import discovery_db_manager as discovery
 from Bots.db_managers.task_db_manager import (
@@ -23,6 +24,9 @@ from Bots.db_managers.task_db_manager import (
     retrieve_task_from_database,
     update_task_in_database,
     retrieve_all_tasks_from_database,
+    retrieve_active_tasks_from_database,
+    retrieve_tasks_for_sync,
+    cleanup_stale_drafts,
     delete_task_from_database,
     mark_task_completed,
     retrieve_task_by_id,
@@ -39,12 +43,13 @@ from Bots.db_managers.task_db_manager import (
     delete_assigner_dashboard_channel_from_database,
 )
 
-# Live config — populated by resolve_task_config() on bot startup
-COMMAND_CHANNEL_ID    = 1293531912496746638
-ACTIVE_TASKS_ID       = 1480381619100713041
-DASHBOARD_CATEGORY_ID = 1480152905045774436
-PENDING_CATEGORY_ID   = 1299338707605651537
-EMP_ROLE_ID           = 1290199089371287562
+from Bots.config import (
+    COMMAND_CHANNEL_ID,
+    ACTIVE_TASKS_ID,
+    DASHBOARD_CATEGORY_ID,
+    PENDING_CATEGORY_ID,
+    EMP_ROLE_ID
+)
 
 DEPARTMENTS = {
     "Administration": 1281171713299714059,
@@ -54,40 +59,57 @@ DEPARTMENTS = {
     "Interns": 1281195640109400085,
 }
 
+
+def find_closest_match(name: str, members, cutoff: float = 0.6):
+    """Return the member whose display_name best fuzzy-matches `name`, or None."""
+    names = [m.display_name for m in members]
+    matches = difflib.get_close_matches(name, names, n=1, cutoff=cutoff)
+    if not matches:
+        return None
+    return next((m for m in members if m.display_name == matches[0]), None)
+
 async def resolve_task_config():
     """
     Queries discovery.db to resolve channel and role IDs by name.
     Ensures the bot stays 'living' even after a DB reset.
     """
     global COMMAND_CHANNEL_ID, ACTIVE_TASKS_ID, DASHBOARD_CATEGORY_ID, PENDING_CATEGORY_ID, EMP_ROLE_ID, DEPARTMENTS
-    
-    logger = logging.getLogger("Concord")
 
     # Resolve core IDs
     resolved_cmd = await discovery.get_channel_id_by_name('task-commands')
     if resolved_cmd:
         COMMAND_CHANNEL_ID = resolved_cmd
         logger.info(f"[Task Config] #task-commands → {resolved_cmd}")
+    else:
+        logger.warning("[ERR-TSK-CFG-001] [Task Config] Channel 'task-commands' not found in discovery.db — using fallback ID")
 
-    resolved_vault = await discovery.get_channel_id_by_name('active-tasks')
+    resolved_vault = await discovery.get_category_id_by_name('Task Vault')
     if resolved_vault:
         ACTIVE_TASKS_ID = resolved_vault
-        logger.info(f"[Task Config] #active-tasks → {resolved_vault}")
+        logger.info(f"[Task Config] 'Task Vault' category → {resolved_vault}")
+    else:
+        logger.warning("[ERR-TSK-CFG-002] [Task Config] Category 'Task Vault' not found in discovery.db — using fallback ID")
 
     resolved_dashboard = await discovery.get_category_id_by_name('Task Dashboard')
     if resolved_dashboard:
         DASHBOARD_CATEGORY_ID = resolved_dashboard
         logger.info(f"[Task Config] 'Task Dashboard' → {resolved_dashboard}")
+    else:
+        logger.warning("[ERR-TSK-CFG-003] [Task Config] Category 'Task Dashboard' not found in discovery.db — using fallback ID")
 
     resolved_pending = await discovery.get_category_id_by_name('Pending tasks')
     if resolved_pending:
         PENDING_CATEGORY_ID = resolved_pending
         logger.info(f"[Task Config] 'Pending tasks' → {resolved_pending}")
+    else:
+        logger.warning("[ERR-TSK-CFG-004] [Task Config] Category 'Pending tasks' not found in discovery.db — using fallback ID")
 
     resolved_emp = await discovery.get_role_id_by_name('emp')
     if resolved_emp:
         EMP_ROLE_ID = resolved_emp
         logger.info(f"[Task Config] @emp → {resolved_emp}")
+    else:
+        logger.warning("[ERR-TSK-CFG-005] [Task Config] Role 'emp' not found in discovery.db — using fallback ID")
 
     # Resolve departments
     for dept in DEPARTMENTS.keys():
@@ -95,18 +117,13 @@ async def resolve_task_config():
         if resolved:
             DEPARTMENTS[dept] = resolved
             logger.info(f"[Task Config] @{dept} → {resolved}")
+        else:
+            logger.warning(f"[ERR-TSK-CFG-006] [Task Config] Department role '{dept}' not found in discovery.db — using fallback ID")
 
-    logging.info("[Task Config] Configuration successfully resolved from discovery.db.")
+    logger.info("[Task Config] Configuration successfully resolved from discovery.db.")
 
 
-def find_closest_match(name: str, members):
-    names = [m.display_name.lower() for m in members]
-    matches = difflib.get_close_matches(name.lower(), names, n=1, cutoff=0.6)
-    if matches:
-        for m in members:
-            if m.display_name.lower() == matches[0]:
-                return m
-    return None
+# ── Module-level helpers ──────────────────────────────────────────────────────
 
 def format_deadline(date_str: str) -> str:
     try:
@@ -116,25 +133,130 @@ def format_deadline(date_str: str) -> str:
         return date_str
 
 
+# ── Top-level modals ──────────────────────────────────────────────────────────
+
+class AssigneeDeadlineModal(ui.Modal, title="Set Task Deadline"):
+    """Modal for assignee to enter deadline when acknowledging (Normal/Low priority)."""
+
+    deadline_date = ui.TextInput(
+        label="Deadline Date",
+        style=discord.TextStyle.short,
+        placeholder="DD/MM/YYYY  e.g. 27/03/2026",
+        max_length=10,
+        required=True
+    )
+    deadline_time = ui.TextInput(
+        label="Deadline Time",
+        style=discord.TextStyle.short,
+        placeholder="HH:MM AM/PM  e.g. 02:30 PM",
+        max_length=8,
+        required=True
+    )
+
+    def __init__(self, task, user_id):
+        super().__init__()
+        self.task = task
+        self.user_id = user_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer()
+        except (discord.InteractionResponded, discord.HTTPException):
+            return
+
+        try:
+            dl_dt, deadline_val = parse_datetime_flexible(
+                self.deadline_date.value, self.deadline_time.value
+            )
+        except ValueError as e:
+            cog = interaction.client.get_cog("Tasks")
+            if cog:
+                await cog._send_ephemeral(interaction, f"❌ {e}")
+            else:
+                await interaction.followup.send(f"❌ {e}", ephemeral=True)
+            return
+
+        if dl_dt.replace(tzinfo=IST) <= now_ist():
+            cog = interaction.client.get_cog("Tasks")
+            msg = "❌ Deadline must be after the current date and time."
+            if cog:
+                await cog._send_ephemeral(interaction, msg)
+            else:
+                await interaction.followup.send(msg, ephemeral=True)
+            return
+
+        # Update task with deadline and acknowledge
+        self.task["deadline"] = deadline_val
+        await self._acknowledge_and_update(interaction)
+    
+    async def _acknowledge_and_update(self, interaction: discord.Interaction):
+        """Complete the acknowledgment process."""
+        acknowledged_str = self.task.get("acknowledged_by", "")
+        acknowledged_list = [int(x) for x in acknowledged_str.split(",") if x]
+        
+        if self.user_id not in acknowledged_list:
+            acknowledged_list.append(self.user_id)
+            self.task["acknowledged_by"] = ",".join(map(str, acknowledged_list))
+        
+        try:
+            await update_task_in_database(self.task)
+        except Exception as e:
+            logging.getLogger("Concord").error(f"[ERR-TSK-031] [Task] _acknowledge_and_update DB save failed: {e}")
+            return
+
+        cog = interaction.client.get_cog("Tasks")
+        if cog:
+            await cog.update_main_task_message(self.task)
+
+        # Notify the task thread so the acknowledgement is visible there
+        if cog:
+            t_chan = cog.bot.get_channel(int(self.task.get("channel_id", 0)))
+            if not t_chan:
+                try:
+                    t_chan = await cog.bot.fetch_channel(int(self.task.get("channel_id", 0)))
+                except Exception:
+                    pass
+            if t_chan:
+                dl_str = format_deadline(self.task.get("deadline", ""))
+                await t_chan.send(f"✅ {interaction.user.mention} acknowledged the task and set deadline: **{dl_str}**")
+
+        # Sync channels
+        if cog:
+            await cog._sync_participants(int(self.task.get("assigner_id", 0)), self.task.get("assignee_ids", []), interaction.guild)
+
+        if cog:
+            await cog._send_ephemeral(interaction, f"✅ Task acknowledged! Deadline set: {format_deadline(self.task['deadline'])}")
+        else:
+            await interaction.followup.send(f"✅ Task acknowledged! Deadline set: {format_deadline(self.task['deadline'])}", ephemeral=True)
+
+
+
+# ── Cog ───────────────────────────────────────────────────────────────────────
+
 class TaskCog(commands.Cog, name="Tasks"):
     """Handles task assignment and tracking."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._bg_tasks: list[asyncio.Task] = []
+
+    async def cog_unload(self):
+        for task in self._bg_tasks:
+            task.cancel()
 
     # -------------------------------------------------------------------------
     # Ephemeral helper
     # -------------------------------------------------------------------------
 
-    async def _send_ephemeral(self, interaction: discord.Interaction, content: str, delay: int = 10) -> None:
+    async def _send_ephemeral(self, interaction: discord.Interaction, content: str = "", delay: int = 10, **kwargs) -> None:
         """Send an ephemeral response/followup and auto-delete it after `delay` seconds."""
         msg = None
         if not interaction.response.is_done():
             # If we haven't deferred/responded yet, grab the interaction message
-            await interaction.response.send_message(content, ephemeral=True)
+            await interaction.response.send_message(content=content, ephemeral=True, **kwargs)
             msg = await interaction.original_response()
         else:
-            msg = await interaction.followup.send(content, ephemeral=True)
+            msg = await interaction.followup.send(content=content, ephemeral=True, **kwargs)
 
         async def _del():
             await asyncio.sleep(delay)
@@ -152,7 +274,7 @@ class TaskCog(commands.Cog, name="Tasks"):
 
     async def cog_load(self):
         from Bots.db_managers import task_db_manager as db
-        self.bot.loop.create_task(db.db_worker())
+        self._bg_tasks.append(asyncio.create_task(db.db_worker()))
         await db.initialize_task_db()
         # Ensure discovery event exists
         if not hasattr(self.bot, 'discovery_complete'):
@@ -172,25 +294,28 @@ class TaskCog(commands.Cog, name="Tasks"):
                 user = await self.bot.fetch_user(recipient_id)
                 if user:
                     await user.send(content)
-                    logging.info(f"[Task DM] Delivered to {user.name}: {content[:50]}...")
+                    logger.info(f"[Task DM] Delivered to {user.name}: {content[:50]}...")
             except discord.Forbidden:
-                logging.warning(f"[ERR-TSK-001] [Task DM] Forbidden for recipient {recipient_id}")
+                logger.warning(f"[ERR-TSK-001] [Task DM] Forbidden for recipient {recipient_id}")
             except Exception as e:
-                logging.error(f"[ERR-TSK-002] [Task DM] Error: {e}")
+                logger.error(f"[ERR-TSK-002] [Task DM] Error: {e}")
         else:
             # Queue for later — use IST-aware timestamp
-            from Bots.db_managers.task_db_manager import db_execute, get_conn
+            from Bots.db_managers.task_db_manager import db_execute, get_conn, put_conn
             scheduled_at = now_ist()
             def _queue():
-                with get_conn() as conn:
+                conn = get_conn()
+                try:
                     with conn.cursor() as cur:
                         cur.execute('''
                             INSERT INTO notification_queue (task_id, recipient_id, content, scheduled_at)
                             VALUES (%s, %s, %s, %s)
                         ''', (task_id, recipient_id, content, scheduled_at))
                     conn.commit()
+                finally:
+                    put_conn(conn)
             await db_execute(_queue)
-            logging.info(f"[Task Queue] Queued notification for task {task_id} to user {recipient_id}")
+            logger.info(f"[Task Queue] Queued notification for task {task_id} to user {recipient_id}")
 
     # Start engines handled in on_ready
 
@@ -203,6 +328,8 @@ class TaskCog(commands.Cog, name="Tasks"):
                 
                 tasks = await retrieve_all_tasks_from_database()
                 for task in tasks:
+                    if str(task.get('channel_id', '0')) in ('0', ''):
+                        continue  # skip stale draft rows with no real channel
                     if task.get('global_state') == 'Finalized' and task.get('completed_at'):
                         completed_at = task.get('completed_at')
                         # Ensure we are comparing offset-aware or offset-naive consistently
@@ -211,7 +338,8 @@ class TaskCog(commands.Cog, name="Tasks"):
                         if completed_at.tzinfo is None:
                             completed_at = completed_at.replace(tzinfo=IST)
                         if now - completed_at >= timedelta(hours=24):
-                            logging.info(f"[Task Cleanup] Archiving 24h+ finalized task: {task['title']} (ID: {task['task_id']})")
+                            task_title = task.get('title', f"Task {task.get('task_id', 'Unknown')}")
+                            logger.info(f"[Task Cleanup] Archiving 24h+ finalized task: {task_title} (ID: {task.get('task_id')})")
                             
                             temp_channel = self.bot.get_channel(int(task["channel_id"]))
                             if not temp_channel:
@@ -230,7 +358,7 @@ class TaskCog(commands.Cog, name="Tasks"):
                             await delete_task_from_database(int(task["channel_id"]))
                             
             except Exception as e:
-                logging.error(f"[ERR-TSK-003] [Task Cleanup] Engine error: {e}")
+                logger.error(f"[ERR-TSK-003] [Task Cleanup] Engine error: {e}")
 
     # -------------------------------------------------------------------------
     # Events
@@ -238,19 +366,20 @@ class TaskCog(commands.Cog, name="Tasks"):
 
     @commands.Cog.listener()
     async def on_ready(self):
+        await self.bot.discovery_complete.wait()
         await resolve_task_config()
         
-        # Start background engines
-        asyncio.create_task(self.check_and_remove_invalid_tasks())
-        asyncio.create_task(self.task_reminder_engine())
-        asyncio.create_task(self.task_archive_cleanup_engine())
+        # Start background engines — store handles so cog_unload can cancel them
+        self._bg_tasks.append(asyncio.create_task(self.check_and_remove_invalid_tasks()))
+        self._bg_tasks.append(asyncio.create_task(self.task_reminder_engine()))
+        self._bg_tasks.append(asyncio.create_task(self.task_archive_cleanup_engine()))
 
         command_channel = self.bot.get_channel(COMMAND_CHANNEL_ID)
         if not command_channel:
             try:
                 command_channel = await self.bot.fetch_channel(COMMAND_CHANNEL_ID)
             except Exception:
-                logging.warning("[ERR-TSK-004] [Task] Command channel not found.")
+                logger.warning("[ERR-TSK-004] [Task] Command channel not found.")
                 return
 
         async for message in command_channel.history(limit=100):
@@ -262,7 +391,7 @@ class TaskCog(commands.Cog, name="Tasks"):
                     for item in message.components[0].children
                 )
             ):
-                logging.info("[Task] Command buttons already exist in the command channel.")
+                logger.info("[Task] Command buttons already exist in the command channel.")
                 return
 
         view = ui.View(timeout=None)
@@ -279,7 +408,7 @@ class TaskCog(commands.Cog, name="Tasks"):
         embed.set_footer(text="Concord Unified Engine")
 
         await command_channel.send(embed=embed, view=view)
-        logging.info("[Task] Created command buttons in command channel.")
+        logger.info("[Task] Created command buttons in command channel.")
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
@@ -308,18 +437,26 @@ class TaskCog(commands.Cog, name="Tasks"):
                     await self.handle_dash_done(interaction, task)
                 elif custom_id.startswith("dash_block_"):
                     await self.handle_dash_block(interaction, task)
+                elif custom_id.startswith("dash_reject_"):
+                    await self.handle_dash_reject(interaction, task)
                 elif custom_id.startswith("dash_part_"):
                     await self.handle_dash_part(interaction, task)
                 elif custom_id.startswith("dash_upd_"):
                     await self.handle_dash_upd(interaction, task)
+                elif custom_id.startswith("dash_resolve_block_"):
+                    await self.handle_resolve_block(interaction, task)
+                elif custom_id.startswith("dash_req_deadline_"):
+                    await self.handle_req_deadline(interaction, task)
                 return
             except Exception as e:
-                logging.error(f"[ERR-TSK-005] [Task] Dashboard interaction error: {e}")
+                logger.error(f"[ERR-TSK-005] [Task #{task_id_str}] Dashboard interaction error: {e}")
                 return
 
         # Recover zombie views from bot reboots (ID-based rehydration)
-        if any(custom_id.startswith(pfx) for pfx in ("manage_", "mark_complete_", "ack_", "approve_panel_", "close_task_panel_", "modify_deadline_panel_", "revise_panel_", "remind_task_panel_", "add_assignee_panel_", "req_rev_panel_")):
+        if any(custom_id.startswith(pfx) for pfx in ("manage_", "mark_complete_", "ack_", "approve_panel_", "close_task_panel_", "modify_deadline_panel_", "revise_panel_", "remind_task_panel_", "add_assignee_panel_", "req_rev_panel_", "approve_deadline_", "deny_deadline_")):
             try:
+                if interaction.response.is_done():
+                    return
                 task_id_str = custom_id.split("_")[-1]
                 if task_id_str.isdigit():
                     task = await retrieve_task_by_id(int(task_id_str))
@@ -329,25 +466,41 @@ class TaskCog(commands.Cog, name="Tasks"):
                 if task:
                     # Determine which view generated this button
                     view = None
-                    if any(custom_id.startswith(pfx) for pfx in ("manage_", "mark_complete_", "ack_", "approve_panel_", "revise_panel_", "req_rev_panel_")):
+                    # manage_, mark_complete_, ack_, approve_deadline_, deny_deadline_ live in get_main_task_view.
+                    # Everything else (control panel buttons) lives in get_assigner_control_view.
+                    if any(custom_id.startswith(pfx) for pfx in ("manage_", "mark_complete_", "ack_", "approve_deadline_", "deny_deadline_")):
                         view = self.get_main_task_view(task)
                     else:
                         view = self.get_assigner_control_view(task)
-                        
+
                     for child in view.children:
                         if getattr(child, "custom_id", "") == custom_id:
-                            await child.callback(interaction)
+                            # Final is_done() check: a live view may have handled this
+                            # interaction during the DB await above. If so, skip.
+                            if not interaction.response.is_done():
+                                try:
+                                    await child.callback(interaction)
+                                except discord.InteractionResponded:
+                                    pass  # Live view beat us to it — not an error
+                                except discord.HTTPException as e:
+                                    if e.code != 40060:
+                                        logger.warning(f"[Task] Zombie callback HTTP error ({e.code}): {e}")
+                                    # 40060 = already acknowledged by live view winning the race — not an error
                             return
-                
+
                 if not interaction.response.is_done():
                     await self._send_ephemeral(interaction, "This interaction expired or the task was not found.")
+            except discord.InteractionResponded:
+                pass  # Live view handled the interaction before zombie rehydration finished
+            except discord.HTTPException as e:
+                if e.code != 40060:
+                    logger.error(f"[ERR-TSK-006] [Task #{task_id_str}] Zombie interaction recovery HTTP error ({e.code}): {e}")
+                # 40060 = interaction already acknowledged — harmless race between live view and rehydration
             except Exception as e:
-                logging.error(f"[ERR-TSK-006] [Task] Zombie interaction recovery error: {e}")
+                logger.error(f"[ERR-TSK-006] [Task #{task_id_str}] Zombie interaction recovery error: {e}")
 
         # Draft Recovery Handler
         elif custom_id.startswith("confirm_assign_"):
-            # Give the view a moment to handle this natively (if it's alive)
-            await asyncio.sleep(0.5)
             if interaction.response.is_done():
                 return
                 
@@ -365,127 +518,248 @@ class TaskCog(commands.Cog, name="Tasks"):
                 # This logic is extracted for reuse
                 await self.process_confirmed_task_draft(interaction, draft, assignees)
             except Exception as e:
-                logging.error(f"[ERR-TSK-007] [Task] Draft recovery error: {e}")
+                logger.error(f"[ERR-TSK-007] [Task] Draft recovery error: {e}")
                 await self._send_ephemeral(interaction, f"Call [ERR-TSK-008] Error recovering assignment: {e}")
 
     # -------------------------------------------------------------------------
-    # Assign Task flow
-    # -------------------------------------------------------------------------
+    # ── Task Creation ─────────────────────────────────────────────────────────
 
     async def handle_assign_task(self, interaction: discord.Interaction):
+        """New simplified workflow: Select assignees first, then fill details."""
         try:
-            class TaskDetailsModal(ui.Modal, title="Enter Task Details"):
-                task_title = ui.TextInput(label="Task Title", style=discord.TextStyle.short, placeholder="Concise title", required=True)
-                task_details = ui.TextInput(label="Task Description", style=discord.TextStyle.long, placeholder="Detailed explanation", required=True)
-                task_deadline = ui.TextInput(label="Deadline", style=discord.TextStyle.short, placeholder="DD/MM/YYYY HH:MM AM/PM", required=True)
-                task_priority = ui.TextInput(label="Priority (High/Medium/Low)", style=discord.TextStyle.short, default="Normal", required=False)
+            # Step 1: Select assignees
+            class AssigneeSelect(ui.UserSelect):
+                def __init__(self):
+                    super().__init__(placeholder="Search & select assignees...", min_values=1, max_values=10)
+                
+                async def callback(self_select, select_interaction: discord.Interaction):
+                    if not self_select.values:
+                        await self._send_ephemeral(select_interaction, "Please select at least one assignee.")
+                        return
+
+                    # Prevent self-assignment
+                    if select_interaction.user.id in [u.id for u in self_select.values]:
+                        await self._send_ephemeral(select_interaction, "❌ You cannot assign a task to yourself.")
+                        return
+
+                    # Store selected assignees and proceed to modal
+                    self_select.view.selected_assignees = self_select.values  # type: ignore
+                    await select_interaction.response.send_modal(TaskDetailsModal(self_select.values, interaction))
+
+            class TaskDetailsModal(ui.Modal, title="Task Details"):
+                def __init__(self_modal, assignees, original_interaction):
+                    super().__init__()
+                    self_modal.assignees = assignees
+                    self_modal.original_interaction = original_interaction
+
+                priority = ui.TextInput(
+                    label="Priority (High/Normal/Low)",
+                    style=discord.TextStyle.short,
+                    placeholder="Enter: High, Normal, or Low",
+                    default="Normal",
+                    required=True,
+                    max_length=10
+                )
+                description = ui.TextInput(
+                    label="Task Description",
+                    style=discord.TextStyle.long,
+                    placeholder="Detailed explanation of the task...",
+                    required=True
+                )
+                note = ui.TextInput(
+                    label="Note/Remark (optional)",
+                    style=discord.TextStyle.long,
+                    placeholder="Add any notes or remarks for this task...",
+                    required=False
+                )
+                deadline_date = ui.TextInput(
+                    label="Deadline Date (optional)",
+                    style=discord.TextStyle.short,
+                    placeholder="DD/MM/YYYY  e.g. 27/03/2026",
+                    max_length=10,
+                    required=False
+                )
+                deadline_time = ui.TextInput(
+                    label="Deadline Time (optional)",
+                    style=discord.TextStyle.short,
+                    placeholder="HH:MM AM/PM  e.g. 02:30 PM",
+                    max_length=8,
+                    required=False
+                )
 
                 async def on_submit(self_modal, modal_interaction: discord.Interaction):
-                    # 1. Save Draft for reboot recovery
-                    draft_id = await store_task_draft(interaction.user.id, {
-                        "title": self_modal.task_title.value,
-                        "details": self_modal.task_details.value,
-                        "deadline": self_modal.task_deadline.value,
-                        "priority": self_modal.task_priority.value
-                    })
+                    try:
+                        await self_modal.original_interaction.delete_original_response()
+                    except Exception:
+                        pass
 
-                    class AssigneeSelect(ui.UserSelect):
-                        def __init__(self):
-                            super().__init__(placeholder="Select Assignees", min_values=1, max_values=10, custom_id=f"confirm_assign_{draft_id}") # type: ignore
-                        
-                        async def callback(self, select_interaction: discord.Interaction):
-                            if not self.values:
-                                await self._send_ephemeral(select_interaction, "Please select at least one assignee.")
-                                return
-                            # Instead of a silent deferral, immediately update the ephemeral message to show success
-                            await select_interaction.response.edit_message(content="Task successfully assigned! Setting up thread...", view=None)
+                    await modal_interaction.response.defer(ephemeral=True)
 
-                            # Re-read draft to ensure freshness
-                            from Bots.db_managers.task_db_manager import retrieve_task_draft
-                            draft = await retrieve_task_draft(draft_id)
-                            if not draft:
-                                # We already responded with edit_message, so we use followup
-                                return await select_interaction.followup.send("Call [ERR-TSK-009]: Draft lost. Please try again.", ephemeral=True)
-                            
-                            # Because we've already responded to the interaction using edit_message, 
-                            # we must not defer again inside process_confirmed_task_draft. 
-                            # Adding an explicit flag or using a different interaction approach is needed.
-                            # We just pass the interaction. It shouldn't defer if already done.
-                            await self_cog.process_confirmed_task_draft(select_interaction, draft, self.values)
+                    priority_val = self_modal.priority.value.strip().lower()
+                    if priority_val not in ["high", "normal", "low"]:
+                        await self._send_ephemeral(modal_interaction, "❌ Invalid priority. Use: High, Normal, or Low.")
+                        return
 
-                    # Pass self_cog specifically into scope to prevent closure rebind issues
-                    self_cog = self
-                    select = AssigneeSelect()
-                    view = ui.View(timeout=None)
-                    view.add_item(select)
-                    
-                    await modal_interaction.response.send_message("Please select the assignees for this task. It will be assigned immediately once selected:", view=view, ephemeral=True)
+                    date_raw = self_modal.deadline_date.value.strip()
+                    time_raw = self_modal.deadline_time.value.strip().upper()
 
-            await interaction.response.send_modal(TaskDetailsModal())
+                    assigner_deadline = None
+                    if date_raw or time_raw:
+                        if not date_raw or not time_raw:
+                            await self._send_ephemeral(modal_interaction, "❌ Both Deadline Date and Deadline Time must be filled, or both left empty.")
+                            return
+                        try:
+                            dl_dt, assigner_deadline = parse_datetime_flexible(date_raw, time_raw)
+                        except ValueError as e:
+                            await self._send_ephemeral(modal_interaction, f"❌ {e}")
+                            return
+                        if dl_dt.replace(tzinfo=IST) <= now_ist():
+                            await self._send_ephemeral(modal_interaction, "❌ Deadline must be after the current date and time.")
+                            return
+
+                    task_data = {
+                        "priority": priority_val.capitalize(),
+                        "description": self_modal.description.value,
+                        "checklist": self_modal.note.value.strip() if self_modal.note.value else "",
+                        "assignees": self_modal.assignees
+                    }
+                    await self.process_task_assignment(modal_interaction, task_data, assigner_deadline=assigner_deadline)
+
+            # Create view with assignee select
+            view = ui.View(timeout=None)
+            view.selected_assignees = None  # type: ignore
+            view.add_item(AssigneeSelect())
+            
+            await interaction.response.send_message(
+                "👥 Select assignee(s) for this task:",
+                view=view,
+                ephemeral=True
+            )
             
         except discord.NotFound as e:
-            logging.warning(f"[ERR-TSK-010] [Task] Interaction expired or not found: {e}")
+            logger.warning(f"[ERR-TSK-010] [Task] Interaction expired or not found: {e}")
         except Exception as e:
-            logging.error(f"[ERR-TSK-011] [Task] handle_assign_task error: {e}")
+            logger.error(f"[ERR-TSK-011] [Task] handle_assign_task error: {e}")
             try:
                 if not interaction.response.is_done():
                     await self._send_ephemeral(interaction, f"Call [ERR-TSK-012]: An error occurred: {e}")
             except Exception:
                 pass
 
+    async def process_task_assignment(self, interaction: discord.Interaction, task_data: dict, assigner_deadline: str | None = None):
+        """Process task assignment with new simplified workflow."""
+        try:
+            guild = interaction.guild
+            if not guild:
+                await self._send_ephemeral(interaction, "❌ Guild not found.")
+                return
+
+            assignees = task_data["assignees"]
+            assigner = interaction.user
+            priority = task_data["priority"]
+            description = task_data["description"]
+            checklist = task_data.get("checklist", "")
+
+            # Generate thread name based on priority (no title anymore)
+            thread_name = f"{priority} Priority Task"
+
+            # Build task data for database (channel_id set to None until thread is created)
+            db_task_data = {
+                "channel_id": None,
+                "assignees": [u.display_name for u in assignees],
+                "assignee_ids": [u.id for u in assignees],
+                "details": description,
+                "deadline": assigner_deadline or "",  # May be empty for non-high or if assigner skipped
+                "priority": priority,
+                "temp_channel_link": "",
+                "assigner": assigner.display_name,
+                "assigner_id": assigner.id,
+                "status": "Pending",
+                "title": thread_name,  # Store thread name as title for compatibility
+                "global_state": "Active",
+                "completion_vector": ",".join(["0"] * len(assignees)),
+                "activity_log": "",
+                "reminders_sent": "",
+                "task_id": 0,
+                "checklist": checklist,  # Store checklist for later use
+                "assigner_deadline": assigner_deadline  # Track if assigner set a deadline
+            }
+
+            new_task_id = await store_task_in_database(db_task_data)
+            db_task_data["task_id"] = new_task_id
+
+            # Fetch the task-assigner channel (where assignment buttons live)
+            task_assigner_ch = self.bot.get_channel(COMMAND_CHANNEL_ID)
+            if not task_assigner_ch:
+                task_assigner_ch = await self.bot.fetch_channel(COMMAND_CHANNEL_ID)
+
+            # Create a private thread for this task inside the task-assigner channel
+            task_thread = await task_assigner_ch.create_thread(
+                name=f"task-{new_task_id} · {priority} Priority",
+                type=discord.ChannelType.private_thread,
+                invitable=False,
+                auto_archive_duration=10080,  # 7 days
+            )
+            await task_thread.add_user(assigner)
+            for user in assignees:
+                await task_thread.add_user(user)
+
+            view = self.get_main_task_view(db_task_data)
+            main_content = f"Task Assignment Created! {assigner.mention} assigned this to " + ", ".join(u.mention for u in assignees) + "\n" + self._generate_task_markdown(db_task_data)
+
+            # Post main embed + control buttons, then pin it
+            msg = await task_thread.send(content=main_content, view=view)
+            await msg.pin()
+
+            db_task_data["channel_id"] = str(task_thread.id)
+            db_task_data["temp_channel_link"] = task_thread.jump_url
+            db_task_data["main_message_id"] = str(msg.id)
+
+            await update_task_in_database(db_task_data)
+
+            assignee_names = ", ".join(u.display_name for u in assignees)
+            logger.info(f"[Task] Task #{new_task_id} created by {assigner.display_name} → {assignee_names} [{priority}]")
+
+            await self._send_ephemeral(interaction, f"✅ Task successfully assigned in {task_thread.jump_url}")
+
+            # Sync
+            await self._sync_participants(assigner.id, [u.id for u in assignees], guild)
+
+        except Exception as e:
+            logger.error(f"[ERR-TSK-014] [Task] process_task_assignment error: {e}")
+            await self._send_ephemeral(interaction, f"❌ Failed to complete assignment: {e}")
+
+    def _format_checklist(self, checklist: str) -> str:
+        """Format checklist items for display."""
+        if not checklist:
+            return ""
+        items = [item.strip() for item in checklist.replace(",", "\n").split("\n") if item.strip()]
+        return "\n".join(f"- [ ] {item}" for item in items)
+
     async def process_confirmed_task_draft(self, interaction: discord.Interaction, draft, assignees=None):
-        """Processes a task assignment from a draft (on confirm or recovery)."""
-        global ACTIVE_TASKS_ID
-        await interaction.response.defer(ephemeral=True)
+        """Legacy: Processes a task assignment from a draft (on confirm or recovery)."""
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
         try:
             guild = interaction.guild
             if not guild: return
-            
+
             modal_data = draft["modal_data"]
             assigner = self.bot.get_user(draft["user_id"]) or await self.bot.fetch_user(draft["user_id"])
-            
+
             # If assignees not provided (recovery case), we can't proceed directly
-            # The recovery logic needs to handle the select menu or find the original select
             if not assignees:
                 return await self._send_ephemeral(interaction, "Call [ERR-TSK-013]: Please re-select assignees (Selection lost due to bot restart).")
 
-            # API Fallback for Category/Channel resolution
-            vault_channel = guild.get_channel(ACTIVE_TASKS_ID)
-            if not vault_channel:
-                try:
-                    vault_channel = await guild.fetch_channel(ACTIVE_TASKS_ID)
-                except Exception:
-                    vault_channel = discord.utils.get(guild.text_channels, name="active-tasks")
-
-            if not vault_channel:
-                # Creation logic
-                overwrites = {
-                    guild.default_role: discord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=False),
-                    guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_threads=True)
-                }
-                vault_channel = await guild.create_text_channel("active-tasks", overwrites=overwrites)
-                ACTIVE_TASKS_ID = vault_channel.id
-
-            # Create Private Thread
-            thread = await vault_channel.create_thread(
-                name=f"{modal_data['title']}",
-                type=discord.ChannelType.private_thread,
-                invitable=False
-            )
-            
-            # Add participants
-            await thread.add_user(assigner)
-            for user in assignees:
-                await thread.add_user(user)
-
+            # Build draft task data (channel_id set to None until thread is created)
             task_data = {
-                "channel_id": str(thread.id),
+                "channel_id": None,
                 "assignees": [u.display_name for u in assignees],
                 "assignee_ids": [u.id for u in assignees],
                 "details": modal_data["details"],
                 "deadline": modal_data["deadline"],
                 "priority": modal_data["priority"] or "Normal",
-                "temp_channel_link": thread.jump_url,
+                "temp_channel_link": "",
                 "assigner": assigner.display_name,
                 "assigner_id": assigner.id,
                 "status": "Pending",
@@ -500,44 +774,64 @@ class TaskCog(commands.Cog, name="Tasks"):
             new_task_id = await store_task_in_database(task_data)
             task_data["task_id"] = new_task_id
 
+            # Fetch the task-assigner channel (where assignment buttons live)
+            task_assigner_ch = self.bot.get_channel(COMMAND_CHANNEL_ID)
+            if not task_assigner_ch:
+                task_assigner_ch = await self.bot.fetch_channel(COMMAND_CHANNEL_ID)
+
+            priority = task_data["priority"]
+            task_thread = await task_assigner_ch.create_thread(
+                name=f"task-{new_task_id} · {priority} Priority",
+                type=discord.ChannelType.private_thread,
+                invitable=False,
+                auto_archive_duration=10080,  # 7 days
+            )
+            await task_thread.add_user(assigner)
+            for user in assignees:
+                await task_thread.add_user(user)
+
             view = self.get_main_task_view(task_data)
-            msg = await thread.send(
-                content=f"Task Assignment Created! {assigner.mention} assigned this to " + ", ".join(u.mention for u in assignees) + "\n" + self._generate_task_markdown(task_data), 
+            msg = await task_thread.send(
+                content=f"Task Assignment Created! {assigner.mention} assigned this to " + ", ".join(u.mention for u in assignees) + "\n" + self._generate_task_markdown(task_data),
                 view=view
             )
-            
             await msg.pin()
+
+            task_data["channel_id"] = str(task_thread.id)
+            task_data["temp_channel_link"] = task_thread.jump_url
             task_data["main_message_id"] = str(msg.id)
             await update_task_in_database(task_data)
-            
+
             await delete_task_draft(draft["draft_id"])
-            await self._send_ephemeral(interaction, f"Task successfully assigned in {thread.jump_url}.")
+            try:
+                await interaction.delete_original_response()
+            except Exception:
+                pass
+            await self._send_ephemeral(interaction, f"Task successfully assigned in {task_thread.jump_url}.")
 
             # Sync
-            await self.sync_user_pending_tasks(assigner.id, guild)
-            await self.sync_user_dashboard_tasks(assigner.id, guild)
-            for u in assignees:
-                await self.sync_user_pending_tasks(u.id, guild)
-                await self.sync_user_dashboard_tasks(u.id, guild)
+            await self._sync_participants(assigner.id, [u.id for u in assignees], guild)
 
         except Exception as e:
-            logging.error(f"[ERR-TSK-014] [Task] process_confirmed_task_draft error: {e}")
+            logger.error(f"[ERR-TSK-014] [Task] process_confirmed_task_draft error: {e}")
             await self._send_ephemeral(interaction, f"Call [ERR-TSK-015]: Failed to complete assignment: {e}")
 
-    # -------------------------------------------------------------------------
-    # View Tasks flow
-    # -------------------------------------------------------------------------
+    # ── Dashboard Interaction Handlers ────────────────────────────────────────
 
     async def handle_dash_mod(self, interaction: discord.Interaction, task):
         class ModifyDeadlineModal(ui.Modal, title="Modify Deadline"):
-            new_deadline = ui.TextInput(label="New Deadline", style=discord.TextStyle.short, placeholder="DD/MM/YYYY HH:MM AM/PM", required=True)
+            new_deadline_date = ui.TextInput(label="New Deadline Date", style=discord.TextStyle.short, placeholder="DD/MM/YYYY  e.g. 27/03/2026", max_length=10, required=True)
+            new_deadline_time = ui.TextInput(label="New Deadline Time", style=discord.TextStyle.short, placeholder="HH:MM AM/PM  e.g. 02:30 PM", max_length=8, required=True)
             async def on_submit(self_modal, modal_interaction: discord.Interaction):
                 await modal_interaction.response.defer(ephemeral=True)
-                new_val = self_modal.new_deadline.value.strip()
                 try:
-                    datetime.strptime(new_val, "%d/%m/%Y %I:%M %p")
-                except ValueError:
-                    return await self._send_ephemeral(modal_interaction, "❌ Call [ERR-TSK-016]: Invalid format. Use `DD/MM/YYYY HH:MM AM/PM`")
+                    dl_dt, new_val = parse_datetime_flexible(
+                        self_modal.new_deadline_date.value, self_modal.new_deadline_time.value
+                    )
+                except ValueError as e:
+                    return await self._send_ephemeral(modal_interaction, f"❌ [ERR-TSK-016] {e}")
+                if dl_dt.replace(tzinfo=IST) <= now_ist():
+                    return await self._send_ephemeral(modal_interaction, "❌ Deadline must be after the current date and time.")
 
                 task["deadline"] = new_val
                 await update_task_in_database(task)
@@ -545,38 +839,38 @@ class TaskCog(commands.Cog, name="Tasks"):
                 await self._send_ephemeral(modal_interaction, "Deadline updated.")
                 
                 # Sync
-                await self.sync_user_pending_tasks(task["assigner_id"], modal_interaction.guild)
-                await self.sync_user_dashboard_tasks(task["assigner_id"], modal_interaction.guild)
-                for uid in task["assignee_ids"]:
-                    await self.sync_user_pending_tasks(uid, modal_interaction.guild)
-                    await self.sync_user_dashboard_tasks(uid, modal_interaction.guild)
+                await self._sync_participants(task["assigner_id"], task["assignee_ids"], modal_interaction.guild)
 
         await interaction.response.send_modal(ModifyDeadlineModal())
 
     async def handle_dash_cancel(self, interaction: discord.Interaction, task):
         if interaction.user.id != task["assigner_id"]:
-            return await self._send_ephemeral(interaction, "Only the assigner can cancel this task.")
+            return await self._send_ephemeral(interaction, f"Only {task.get('assigner')} can cancel this task.")
         
         await interaction.response.defer(ephemeral=True)
         chan = self.bot.get_channel(int(task["channel_id"]))
+        if not chan:
+            try:
+                chan = await self.bot.fetch_channel(int(task["channel_id"]))
+            except Exception:
+                pass
         if chan:
-            await chan.send("❌ **Task Cancelled by Assigner.** Thread will be deleted.")
-            # For threads, we just delete or archive. 
-            await chan.delete()
-        
+            await chan.send(f"❌ **Task Cancelled by {task.get('assigner')}.** This thread is now locked.")
+            if isinstance(chan, discord.Thread):
+                await chan.edit(archived=True, locked=True)
+            else:
+                await chan.delete()
+
         await delete_task_from_database(int(task["channel_id"]))
-        await self._send_ephemeral(interaction, "Task cancelled and thread removed.")
+        logger.info(f"[Task] Task #{task.get('task_id')} cancelled by {interaction.user.display_name}")
+        await self._send_ephemeral(interaction, "Task cancelled and thread locked.")
         
         # Sync
-        await self.sync_user_pending_tasks(task["assigner_id"], interaction.guild)
-        await self.sync_user_dashboard_tasks(task["assigner_id"], interaction.guild)
-        for uid in task["assignee_ids"]:
-            await self.sync_user_pending_tasks(uid, interaction.guild)
-            await self.sync_user_dashboard_tasks(uid, interaction.guild)
+        await self._sync_participants(task["assigner_id"], task["assignee_ids"], interaction.guild)
 
     async def handle_dash_done(self, interaction: discord.Interaction, task):
         if interaction.user.id != task["assigner_id"]:
-            return await self._send_ephemeral(interaction, "Only the assigner can finalize this task.")
+            return await self._send_ephemeral(interaction, f"Only {task.get('assigner')} can finalize this task.")
         
         await interaction.response.defer(ephemeral=True)
         task["global_state"] = "Finalized"
@@ -589,18 +883,15 @@ class TaskCog(commands.Cog, name="Tasks"):
             await chan.send("✅ **Task marked as Fully Complete.** Thread will be archived in 24 hours.")
         
         await self.update_main_task_message(task)
+        logger.info(f"[Task] Task #{task.get('task_id')} finalized by {interaction.user.display_name}")
         await self._send_ephemeral(interaction, "Task finalized.")
         
         # Sync
-        await self.sync_user_pending_tasks(task["assigner_id"], interaction.guild)
-        await self.sync_user_dashboard_tasks(task["assigner_id"], interaction.guild)
-        for uid in task["assignee_ids"]:
-            await self.sync_user_pending_tasks(uid, interaction.guild)
-            await self.sync_user_dashboard_tasks(uid, interaction.guild)
+        await self._sync_participants(task["assigner_id"], task["assignee_ids"], interaction.guild)
 
     async def handle_dash_block(self, interaction: discord.Interaction, task):
         if interaction.user.id not in task["assignee_ids"]:
-            return await self._send_ephemeral(interaction, "Only assignees can report blockers.")
+            return await self._send_ephemeral(interaction, "Only those assigned can report blockers.")
         
         class BlockerModal(ui.Modal, title="Report Blocker"):
             reason = ui.TextInput(label="Reason", style=discord.TextStyle.long, placeholder="What is blocking you?", required=True)
@@ -621,13 +912,45 @@ class TaskCog(commands.Cog, name="Tasks"):
                 if chan:
                     await chan.send(f"⚠️ **BLOCKER REPORTED** by {modal_interaction.user.mention}:\n> {self_modal.reason.value}")
                 
+                logger.info(f"[Task] Task #{task.get('task_id')} blocked by {modal_interaction.user.display_name}")
                 await self._send_ephemeral(modal_interaction, "Blocker reported. Automated nags for assignees are now paused.")
-                
-                # Sync
-                await self.sync_user_pending_tasks(task["assigner_id"], modal_interaction.guild)
-                await self.sync_user_dashboard_tasks(task["assigner_id"], modal_interaction.guild)
+
+                # Sync all parties
+                await self._sync_participants(task["assigner_id"], task["assignee_ids"], modal_interaction.guild)
 
         await interaction.response.send_modal(BlockerModal())
+
+    async def handle_dash_reject(self, interaction: discord.Interaction, task):
+        if interaction.user.id not in task["assignee_ids"]:
+            return await self._send_ephemeral(interaction, "Only those assigned can reject this task.")
+
+        class RejectionModal(ui.Modal, title="Reject Task"):
+            reason = ui.TextInput(label="Reason for Rejection", style=discord.TextStyle.long, placeholder="Why are you rejecting this task?", required=True)
+            async def on_submit(self_modal, modal_interaction: discord.Interaction):
+                await modal_interaction.response.defer(ephemeral=True)
+
+                ts = now_ist().strftime("%Y-%m-%d %H:%M IST")
+                log_entry = f"[{ts}] {modal_interaction.user.display_name} rejected the task. Reason: {self_modal.reason.value}"
+                task["activity_log"] = (task.get("activity_log") or "") + "\n" + log_entry
+                task["status"] = "Rejected"
+                task["global_state"] = "Active"
+
+                await update_task_in_database(task)
+                await self.update_main_task_message(task)
+
+                chan = self.bot.get_channel(int(task["channel_id"]))
+                if chan:
+                    await chan.send(
+                        f"🚫 **Task Rejected** by {modal_interaction.user.mention}:\n> {self_modal.reason.value}\n"
+                        f"<@{task['assigner_id']}> please review and reassign or modify the task."
+                    )
+
+                logger.info(f"[Task] Task #{task.get('task_id')} rejected by {modal_interaction.user.display_name}")
+                await self._send_ephemeral(modal_interaction, "Task rejected. The assigner has been notified.")
+
+                await self._sync_participants(task["assigner_id"], task["assignee_ids"], modal_interaction.guild)
+
+        await interaction.response.send_modal(RejectionModal())
 
     async def handle_assign_dash_mod(self, interaction: discord.Interaction, task):
         # Resolve Assignee channel for jump
@@ -640,22 +963,37 @@ class TaskCog(commands.Cog, name="Tasks"):
 
         if not chan:
             return await self._send_ephemeral(interaction, "Call [ERR-TSK-017]: Could not locate task thread.")
-        
-        await interaction.response.defer(ephemeral=True)
-        idx = task["assignee_ids"].index(interaction.user.id)
-        vector = task["completion_vector"].split(",")
-        vector[idx] = "1"
 
-    async def handle_dash_part(self, interaction: discord.Interaction, task):
-        if interaction.user.id not in task["assignee_ids"]:
-            return await self._send_ephemeral(interaction, "You are not an assignee.")
-        
         await interaction.response.defer(ephemeral=True)
         idx = task["assignee_ids"].index(interaction.user.id)
         vector = task["completion_vector"].split(",")
         vector[idx] = "1"
         task["completion_vector"] = ",".join(vector)
-        
+
+        if all(v == "1" for v in vector):
+            task["global_state"] = "Pending Review"
+            task["status"] = "Pending Assigner Review"
+            if chan:
+                await chan.send(f"✅ **All parts completed!** {task.get('assigner', 'Assigner')}, please review.")
+
+        await update_task_in_database(task)
+        await self.update_main_task_message(task)
+        logger.info(f"[Task] Task #{task.get('task_id')} — {interaction.user.display_name} marked part done (vector: {task['completion_vector']})")
+        await self._send_ephemeral(interaction, "Marked your part as done.")
+
+        # Sync all parties
+        await self._sync_participants(task["assigner_id"], task["assignee_ids"], interaction.guild)
+
+    async def handle_dash_part(self, interaction: discord.Interaction, task):
+        if interaction.user.id not in task["assignee_ids"]:
+            return await self._send_ephemeral(interaction, "You are not an assignee.")
+
+        await interaction.response.defer(ephemeral=True)
+        idx = task["assignee_ids"].index(interaction.user.id)
+        vector = task["completion_vector"].split(",")
+        vector[idx] = "1"
+        task["completion_vector"] = ",".join(vector)
+
         if all(v == "1" for v in vector):
             task["global_state"] = "Pending Review"
             task["status"] = "Pending Assigner Review"
@@ -665,17 +1003,16 @@ class TaskCog(commands.Cog, name="Tasks"):
                     chan = await self.bot.fetch_channel(int(task["channel_id"]))
                 except Exception:
                     pass
-
             if chan:
-                await chan.send("✅ **All parts completed!** Assigner, please review.")
+                await chan.send(f"✅ **All parts completed!** {task.get('assigner', 'Assigner')}, please review.")
 
         await update_task_in_database(task)
         await self.update_main_task_message(task)
+        logger.info(f"[Task] Task #{task.get('task_id')} — {interaction.user.display_name} marked partial done (vector: {task['completion_vector']})")
         await self._send_ephemeral(interaction, "Marked your part as done.")
-        
-        # Sync
-        await self.sync_user_pending_tasks(interaction.user.id, interaction.guild)
-        await self.sync_user_dashboard_tasks(task["assigner_id"], interaction.guild)
+
+        # Sync all parties
+        await self._sync_participants(task["assigner_id"], task["assignee_ids"], interaction.guild)
 
     async def handle_dash_upd(self, interaction: discord.Interaction, task):
         await interaction.response.defer(ephemeral=True)
@@ -688,17 +1025,124 @@ class TaskCog(commands.Cog, name="Tasks"):
 
         if t_ch:
             a_mentions = " ".join([f"<@{uid}>" for uid in task.get('assignee_ids', [])])
-            await t_ch.send(f"🔔 **Update Requested:** {interaction.user.mention} is requesting an update on task **{task['title']}**. {a_mentions}")
+            task_title = task.get('title', f"{task.get('priority', 'Normal')} Priority Task")
+            await t_ch.send(f"🔔 **Update Requested:** {interaction.user.mention} is requesting an update on task **{task_title}**. {a_mentions}")
             await self._send_ephemeral(interaction, f"Update request sent to {t_ch.mention}!")
         else:
             await self._send_ephemeral(interaction, "Call [ERR-TSK-018]: Could not locate the task channel.")
 
+    async def handle_resolve_block(self, interaction: discord.Interaction, task):
+        if interaction.user.id not in task["assignee_ids"]:
+            return await self._send_ephemeral(interaction, "Only those assigned can resolve blockers.")
+            
+        await interaction.response.defer(ephemeral=True)
+        task["status"] = "Pending"
+        task["blocker_reason"] = ""
+        
+        ts = now_ist().strftime("%Y-%m-%d %H:%M IST")
+        log_entry = f"[{ts}] {interaction.user.display_name} resolved the blocker."
+        task["activity_log"] = (task.get("activity_log") or "") + "\n" + log_entry
+        
+        await update_task_in_database(task)
+        await self.update_main_task_message(task)
+        
+        chan = self.bot.get_channel(int(task["channel_id"]))
+        if chan:
+            await chan.send(f"✅ **BLOCKER RESOLVED** by {interaction.user.mention}.")
+            
+        await self._send_ephemeral(interaction, "Blocker resolved. Task is active again.")
+        
+        await self._sync_participants(task["assigner_id"], task["assignee_ids"], interaction.guild)
+
+    async def handle_req_deadline(self, interaction: discord.Interaction, task):
+        if interaction.user.id not in task["assignee_ids"]:
+            return await self._send_ephemeral(interaction, "Only those assigned can request a new deadline.")
+            
+        class ReqDeadlineModal(ui.Modal, title="Request New Deadline"):
+            reason = ui.TextInput(label="Reason & Suggested Date", style=discord.TextStyle.long, required=True)
+            async def on_submit(inner_self, modal_interaction: discord.Interaction):
+                await modal_interaction.response.defer(ephemeral=True)
+                
+                ts = now_ist().strftime("%Y-%m-%d %H:%M IST")
+                log_entry = f"[{ts}] {modal_interaction.user.display_name} requested new deadline: {inner_self.reason.value}"
+                task["activity_log"] = (task.get("activity_log") or "") + "\n" + log_entry
+                
+                await update_task_in_database(task)
+                
+                chan = self_cog.bot.get_channel(int(task["channel_id"]))
+                if chan:
+                    # Construct the inline View here instead of global to easily pass contextual params if it's alive
+                    # Note: Because the user wants to use these robustly, I'll pass the UI inline during req.
+                    view = ui.View(timeout=None)
+                    
+                    approve_btn = ui.Button(label="Approve Deadline", style=discord.ButtonStyle.success, custom_id=f"approve_deadline_{task['task_id']}")
+                    async def approve_cb(i: discord.Interaction):
+                        if i.user.id != task["assigner_id"]: return await self_cog._send_ephemeral(i, "Only the assigner can approve.")
+                        class ModDeadlineModal(ui.Modal, title="Modify Deadline"):
+                            new_dl_date = ui.TextInput(label="New Deadline Date", style=discord.TextStyle.short, placeholder="DD/MM/YYYY  e.g. 27/03/2026", max_length=10)
+                            new_dl_time = ui.TextInput(label="New Deadline Time", style=discord.TextStyle.short, placeholder="HH:MM AM/PM  e.g. 02:30 PM", max_length=8)
+                            async def on_submit(inner_self, mi: discord.Interaction):
+                                await mi.response.defer()
+                                try:
+                                    dl_dt, new_dl_val = parse_datetime_flexible(
+                                        inner_self.new_dl_date.value, inner_self.new_dl_time.value
+                                    )
+                                except ValueError as e:
+                                    await mi.followup.send(f"❌ {e}", ephemeral=True)
+                                    return
+                                if dl_dt.replace(tzinfo=IST) <= now_ist():
+                                    await mi.followup.send("❌ Deadline must be after the current date and time.", ephemeral=True)
+                                    return
+                                task["deadline"] = new_dl_val
+                                ts2 = now_ist().strftime("%Y-%m-%d %H:%M IST")
+                                task["activity_log"] = (task.get("activity_log") or "") + f"\n[{ts2}] Deadline extended to {new_dl_val}"
+                                await update_task_in_database(task)
+                                if chan: await chan.send(f"✅ **Deadline Approved & Updated**: {new_dl_val}")
+                                await self_cog.update_main_task_message(task)
+                                await asyncio.gather(
+                                    self_cog.sync_user_dashboard_tasks(int(task.get("assigner_id", 0)), mi.guild),
+                                    *[coro for uid in task.get("assignee_ids", []) for coro in (
+                                        self_cog.sync_user_pending_tasks(int(uid), mi.guild),
+                                        self_cog.sync_user_dashboard_tasks(int(uid), mi.guild),
+                                    )],
+                                )
+                                try: await i.message.delete()
+                                except: pass
+                        await i.response.send_modal(ModDeadlineModal())
+                        
+                    deny_btn = ui.Button(label="Deny Deadline", style=discord.ButtonStyle.danger, custom_id=f"deny_deadline_{task['task_id']}")
+                    async def deny_cb(i: discord.Interaction):
+                        if i.user.id != task["assigner_id"]: return await self_cog._send_ephemeral(i, "Only the assigner can deny.")
+                        class DenyModal(ui.Modal, title="Deny Reason"):
+                            reason_deny = ui.TextInput(label="Reason", style=discord.TextStyle.long)
+                            async def on_submit(inner_self, mi: discord.Interaction):
+                                await mi.response.defer()
+                                if chan: await chan.send(f"❌ **Deadline Extension Denied** by {i.user.mention}\n> {inner_self.reason_deny.value}\n{modal_interaction.user.mention} please stick to the current schedule.")
+                                try: await i.message.delete()
+                                except: pass
+                        await i.response.send_modal(DenyModal())
+
+                    approve_btn.callback = approve_cb
+                    deny_btn.callback = deny_cb
+                    view.add_item(approve_btn)
+                    view.add_item(deny_btn)
+
+                    await chan.send(f"📅 **NEW DEADLINE REQUESTED** by {modal_interaction.user.mention}:\n> {inner_self.reason.value}\n<@{task['assigner_id']}> Please review and update the deadline.", view=view)
+                    await self_cog.update_main_task_message(task)
+                    
+                await self_cog._send_ephemeral(modal_interaction, "Deadline request sent.")
+                
+        self_cog = self
+        await interaction.response.send_modal(ReqDeadlineModal())
+
     async def handle_view_tasks_button(self, interaction: discord.Interaction):
         try:
             await interaction.response.defer(ephemeral=True)
-            await self.sync_user_pending_tasks(interaction.user.id, interaction.guild)
-            await self.sync_user_dashboard_tasks(interaction.user.id, interaction.guild)
-            
+            await asyncio.gather(
+                self.sync_user_pending_tasks(interaction.user.id, interaction.guild),
+                self.sync_user_dashboard_tasks(interaction.user.id, interaction.guild),
+            )
+
             res_p = await retrieve_pending_tasks_channel(interaction.user.id)
             res_d = await retrieve_assigner_dashboard_channel(interaction.user.id)
             
@@ -712,7 +1156,9 @@ class TaskCog(commands.Cog, name="Tasks"):
                 
             await self._send_ephemeral(interaction, msg)
         except Exception as e:
-            logging.error(f"[ERR-TSK-019] [Task] handle_view_tasks_button error: {e}")
+            logger.error(f"[ERR-TSK-019] [Task] handle_view_tasks_button error: {e}")
+
+    # ── Sync Engines ──────────────────────────────────────────────────────────
 
     async def sync_user_pending_tasks(self, user_id: int, guild: discord.Guild = None):
         """Syncs the 'Pending tasks' channel for an assignee."""
@@ -748,7 +1194,13 @@ class TaskCog(commands.Cog, name="Tasks"):
             if not channel_id:
                 overwrites = {
                     guild.default_role: discord.PermissionOverwrite(read_messages=False),
-                    member: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+                    member: discord.PermissionOverwrite(
+                        read_messages=True, 
+                        send_messages=False,
+                        create_public_threads=False,
+                        create_private_threads=False,
+                        send_messages_in_threads=False
+                    ),
                 }
                 pending_channel = await guild.create_text_channel(
                     f"tasks-for-{member.display_name.lower().replace(' ', '-')}", overwrites=overwrites, category=category
@@ -762,17 +1214,31 @@ class TaskCog(commands.Cog, name="Tasks"):
                     except Exception:
                         # If it's completely gone, let the next block handle it
                         channel_id = None
+                
+                if pending_channel:
+                    await pending_channel.set_permissions(
+                        member, 
+                        read_messages=True, 
+                        send_messages=False,
+                        create_public_threads=False,
+                        create_private_threads=False,
+                        send_messages_in_threads=False
+                    )
 
-            all_tasks = await retrieve_all_tasks_from_database()
-            user_tasks = [t for t in all_tasks if user_id in t.get("assignee_ids", []) and t.get("global_state") == "Active"]
+            all_tasks = await retrieve_tasks_for_sync()
+            user_tasks = [t for t in all_tasks if user_id in t.get("assignee_ids", [])]
             
-            await pending_channel.purge(limit=100) # type: ignore
-            
+            # Extract existing messages safely
+            existing_msg_ids = []
+            if res and res.get('task_message_ids'):
+                existing_msg_ids = [int(x) for x in res['task_message_ids'].split(',') if x]
+
             new_task_ids = []
             new_msg_ids = []
 
             # Batch tasks in groups of 5 to reduce mobile UI bloat
             BATCH_SIZE = 5
+            msg_index = 0
             for batch_start in range(0, len(user_tasks), BATCH_SIZE):
                 batch = user_tasks[batch_start:batch_start + BATCH_SIZE]
                 embeds = []
@@ -788,20 +1254,75 @@ class TaskCog(commands.Cog, name="Tasks"):
                     if task.get("main_message_id") and ch:
                         jump_url = f"https://discord.com/channels/{guild.id}/{task['channel_id']}/{task['main_message_id']}"
 
-                    view.add_item(ui.Button(label=f"Open: {task['title'][:20]}", style=discord.ButtonStyle.link, url=jump_url))
-                    view.add_item(ui.Button(label="[!] Blocker", style=discord.ButtonStyle.danger, custom_id=f"dash_block_{task['task_id']}"))
-                    view.add_item(ui.Button(label="[✔] Done", style=discord.ButtonStyle.success, custom_id=f"dash_part_{task['task_id']}"))
+                    # Use title if available, otherwise generate from priority
+                    task_title = task.get('title') or f"{task.get('priority', 'Normal')} Priority Task"
+                    view.add_item(ui.Button(label=f"Open: {task_title[:20]}", style=discord.ButtonStyle.link, url=jump_url))
+                    
+                    acknowledged_str = task.get("acknowledged_by", "")
+                    acknowledged_list = [int(x) for x in acknowledged_str.split(",") if x]
+                    
+                    # Fetching vector logic to dynamically disable/hide "Done"
+                    assignee_ids_list = task.get("assignee_ids", [])
+                    completion_str = task.get("completion_vector", "")
+                    completion_vector = completion_str.split(",") if completion_str else ["0"] * len(assignee_ids_list)
+                    
+                    is_done = False
+                    try:
+                        if user_id in assignee_ids_list:
+                            idx = assignee_ids_list.index(user_id)
+                            is_done = (completion_vector[idx] == "1")
+                    except ValueError:
+                        pass
+                    
+                    if user_id not in acknowledged_list:
+                        view.add_item(ui.Button(label="Acknowledge Task", style=discord.ButtonStyle.primary, custom_id=f"ack_{task['task_id']}"))
+                    elif is_done:
+                        view.add_item(ui.Button(label="Pending Review", style=discord.ButtonStyle.secondary, custom_id=f"dash_done_{task['task_id']}", disabled=True))
+                    else:
+                        if task.get("status") == "Blocked":
+                            view.add_item(ui.Button(label="Resolve Blocker", style=discord.ButtonStyle.success, custom_id=f"dash_resolve_block_{task['task_id']}"))
+                            view.add_item(ui.Button(label="Request New Deadline", style=discord.ButtonStyle.secondary, custom_id=f"dash_req_deadline_{task['task_id']}"))
+                        else:
+                            view.add_item(ui.Button(label="Reject Task", style=discord.ButtonStyle.danger, custom_id=f"dash_reject_{task['task_id']}"))
+                            view.add_item(ui.Button(label="[✔] Done", style=discord.ButtonStyle.success, custom_id=f"dash_part_{task['task_id']}"))
 
                     new_task_ids.append(str(task["task_id"]))
 
-                msg = await pending_channel.send(embeds=embeds, view=view) # type: ignore
-                for _ in batch:
-                    new_msg_ids.append(str(msg.id))
+                # Try to edit an existing message for this batch frame
+                msg = None
+                while msg_index < len(existing_msg_ids):
+                    try:
+                        msg = await pending_channel.fetch_message(existing_msg_ids[msg_index])
+                        await msg.edit(embeds=embeds, view=view)
+                        msg_index += 1
+                        break
+                    except discord.NotFound:
+                        msg_index += 1
+                
+                # If we couldn't edit, send a new message
+                if not msg:
+                    msg = await pending_channel.send(embeds=embeds, view=view) # type: ignore
+                    
+                # We store just one master message ID representation for this batch block 
+                # (though historically we appended it batch_size times, this is cleaner)
+                new_msg_ids.append(str(msg.id))
+                    
+                if any(t.get("priority", "Normal").lower() == "high" for t in batch):
+                    try: await msg.pin()
+                    except discord.HTTPException: pass
+
+            # Delete any leftover messages that are no longer needed
+            for leftover in existing_msg_ids[msg_index:]:
+                try:
+                    leftover_msg = await pending_channel.fetch_message(leftover)
+                    await leftover_msg.delete()
+                except discord.NotFound:
+                    pass
 
             await update_pending_tasks_channel(user_id, new_task_ids, new_msg_ids)
             
         except Exception as e:
-            logging.error(f"[ERR-TSK-020] [Task] sync_user_pending_tasks error: {e}")
+            logger.error(f"[ERR-TSK-020] [Task] sync_user_pending_tasks error: {e}")
 
     async def sync_user_dashboard_tasks(self, user_id: int, guild: discord.Guild = None):
         """Syncs the 'Task Dashboard' channel for an assigner."""
@@ -837,7 +1358,13 @@ class TaskCog(commands.Cog, name="Tasks"):
             if not channel_id:
                 overwrites = {
                     guild.default_role: discord.PermissionOverwrite(read_messages=False),
-                    member: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+                    member: discord.PermissionOverwrite(
+                        read_messages=True, 
+                        send_messages=False,
+                        create_public_threads=False,
+                        create_private_threads=False,
+                        send_messages_in_threads=False
+                    ),
                 }
                 dash_channel = await guild.create_text_channel(
                     f"assigned-by-{member.display_name.lower().replace(' ', '-')}", overwrites=overwrites, category=category
@@ -850,18 +1377,32 @@ class TaskCog(commands.Cog, name="Tasks"):
                         dash_channel = await self.bot.fetch_channel(int(channel_id))
                     except Exception:
                         channel_id = None
+                
+                if dash_channel:
+                    await dash_channel.set_permissions(
+                        member, 
+                        read_messages=True, 
+                        send_messages=False,
+                        create_public_threads=False,
+                        create_private_threads=False,
+                        send_messages_in_threads=False
+                    )
 
-            all_tasks = await retrieve_all_tasks_from_database()
+            all_tasks = await retrieve_tasks_for_sync()
             # Dashboard shows tasks you ASSIGNED
-            user_tasks = [t for t in all_tasks if user_id == t.get("assigner_id") and t.get("global_state") == "Active"]
+            user_tasks = [t for t in all_tasks if user_id == t.get("assigner_id")]
             
-            await dash_channel.purge(limit=100) # type: ignore
+            # Extract existing messages safely
+            existing_msg_ids = []
+            if res and res.get('task_message_ids'):
+                existing_msg_ids = [int(x) for x in res['task_message_ids'].split(',') if x]
             
             new_task_ids = []
             new_msg_ids = []
 
             # Batch tasks in groups of 5 to reduce mobile UI bloat
             BATCH_SIZE = 5
+            msg_index = 0
             for batch_start in range(0, len(user_tasks), BATCH_SIZE):
                 batch = user_tasks[batch_start:batch_start + BATCH_SIZE]
                 embeds = []
@@ -871,51 +1412,112 @@ class TaskCog(commands.Cog, name="Tasks"):
                     embed = self._build_dashboard_embed(task)
                     embeds.append(embed)
 
-                    # Request Update button
-                    view.add_item(ui.Button(label=f"Update: {task['title'][:20]}", style=discord.ButtonStyle.primary, custom_id=f"dash_upd_{task['task_id']}"))
+                    if task.get("global_state") == "Pending Review":
+                        view.add_item(ui.Button(label="Approve Task", style=discord.ButtonStyle.success, custom_id=f"approve_panel_{task['task_id']}"))
+                        view.add_item(ui.Button(label="Request Revision", style=discord.ButtonStyle.danger, custom_id=f"revise_panel_{task['task_id']}"))
 
                     # Link Button
                     jump_url = task.get("temp_channel_link")
                     ch = self.bot.get_channel(int(task["channel_id"]))
                     if task.get("main_message_id") and ch:
                         jump_url = f"https://discord.com/channels/{guild.id}/{task['channel_id']}/{task['main_message_id']}"
-                    view.add_item(ui.Button(label=f"Go: {task['title'][:20]}", style=discord.ButtonStyle.link, url=jump_url))
+                    # Use title if available, otherwise generate from priority
+                    task_title = task.get('title') or f"{task.get('priority', 'Normal')} Priority Task"
+                    view.add_item(ui.Button(label=f"Go: {task_title[:20]}", style=discord.ButtonStyle.link, url=jump_url))
 
                     new_task_ids.append(str(task["task_id"]))
 
-                msg = await dash_channel.send(embeds=embeds, view=view) # type: ignore
-                for _ in batch:
-                    new_msg_ids.append(str(msg.id))
+                # Try to edit an existing message for this batch frame
+                msg = None
+                while msg_index < len(existing_msg_ids):
+                    try:
+                        msg = await dash_channel.fetch_message(existing_msg_ids[msg_index])
+                        await msg.edit(embeds=embeds, view=view)
+                        msg_index += 1
+                        break
+                    except discord.NotFound:
+                        msg_index += 1
+                
+                # If we couldn't edit, send a new message
+                if not msg:
+                    msg = await dash_channel.send(embeds=embeds, view=view) # type: ignore
+                    
+                # Store message ID footprint cleanly
+                new_msg_ids.append(str(msg.id))
+
+            # Delete any leftover messages that are no longer needed
+            for leftover in existing_msg_ids[msg_index:]:
+                try:
+                    leftover_msg = await dash_channel.fetch_message(leftover)
+                    await leftover_msg.delete()
+                except discord.NotFound:
+                    pass
 
             await update_assigner_dashboard_channel(user_id, new_task_ids, new_msg_ids)
             
         except Exception as e:
-            logging.error(f"[ERR-TSK-021] [Task] sync_user_dashboard_tasks error: {e}")
+            logger.error(f"[ERR-TSK-021] [Task] sync_user_dashboard_tasks error: {e}")
+
+    async def _sync_participants(self, assigner_id: int, assignee_ids, guild: discord.Guild):
+        """Concurrently sync pending+dashboard views for all task participants."""
+        coros = [
+            self.sync_user_pending_tasks(assigner_id, guild),
+            self.sync_user_dashboard_tasks(assigner_id, guild),
+        ]
+        for uid in assignee_ids:
+            coros.append(self.sync_user_pending_tasks(int(uid), guild))
+            coros.append(self.sync_user_dashboard_tasks(int(uid), guild))
+        await asyncio.gather(*coros)
 
     # -------------------------------------------------------------------------
-    # Embed Builders (Task 2: Dashboard Embed Consolidation)
-    # -------------------------------------------------------------------------
+    # ── Embed & Markdown Builders ─────────────────────────────────────────────
 
     def _build_pending_embed(self, task: dict, guild: discord.Guild = None) -> discord.Embed:
         """Unified pending-task embed with priority-based coloring and IST footer."""
         priority = task.get("priority", "Normal").lower()
-        color_map = {"high": 0xFF0000, "medium": 0xFFFF00, "low": 0x95A5A6}
-        embed_color = color_map.get(priority, 0x00FF00)
+        color_map = {"high": 0xFF0000, "normal": 0x3498db, "low": 0x95A5A6}
+        embed_color = color_map.get(priority, 0x3498db)
 
-        embed = discord.Embed(title=f"📌 Pending Task: {task['title']}", color=embed_color)
+        title = task.get('title', f"{task.get('priority', 'Normal')} Priority Task")
+        embed = discord.Embed(title=f"📌 {title}", color=embed_color)
         embed.add_field(name="Details", value=task['details'][:1024], inline=False)
-        embed.add_field(name="Deadline", value=format_deadline(task['deadline']), inline=True)
+
+        deadline = task.get('deadline', '')
+        deadline_display = format_deadline(deadline) if deadline else "⏳ Awaiting deadline acceptance"
+        embed.add_field(name="Deadline", value=deadline_display, inline=True)
         embed.add_field(name="Priority", value=task.get('priority', 'Normal'), inline=True)
+        embed.add_field(name="State", value=task.get('global_state', 'Active'), inline=True)
+
+        created_at = task.get('created_at')
+        try:
+            posted_str = created_at.astimezone(IST).strftime('%d %b %Y, %I:%M %p IST') if hasattr(created_at, 'strftime') else str(created_at) if created_at else "—"
+        except Exception:
+            posted_str = "—"
+        embed.add_field(name="Posted", value=posted_str, inline=False)
+
         embed.set_footer(text=f"Synced: {now_ist().strftime('%d %b, %Y %I:%M %p IST')} | Concord Engine")
         return embed
 
     def _build_dashboard_embed(self, task: dict) -> discord.Embed:
         """Unified assigner-dashboard embed with IST footer."""
-        embed = discord.Embed(title=f"⚙️ Managing: {task['title']}", color=0x3498db)
-        assignees = ", ".join(task["assignees"])
-        embed.add_field(name="Assignees", value=assignees, inline=False)
+        title = task.get('title', f"{task.get('priority', 'Normal')} Priority Task")
+        embed = discord.Embed(title=f"⚙️ Managing: {title}", color=0x3498db)
+        embed.add_field(name="Assignees", value=", ".join(task["assignees"]), inline=False)
         embed.add_field(name="Status", value=task.get('status', 'Pending'), inline=True)
-        embed.add_field(name="Deadline", value=format_deadline(task['deadline']), inline=True)
+        embed.add_field(name="State", value=task.get('global_state', 'Active'), inline=True)
+        embed.add_field(name="Priority", value=task.get('priority', 'Normal'), inline=True)
+
+        deadline = task.get('deadline', '')
+        deadline_display = format_deadline(deadline) if deadline else "⏳ Pending assignee input"
+        embed.add_field(name="Deadline", value=deadline_display, inline=True)
+
+        created_at = task.get('created_at')
+        try:
+            posted_str = created_at.astimezone(IST).strftime('%d %b %Y, %I:%M %p IST') if hasattr(created_at, 'strftime') else str(created_at) if created_at else "—"
+        except Exception:
+            posted_str = "—"
+        embed.add_field(name="Posted", value=posted_str, inline=False)
+
         embed.set_footer(text=f"Synced: {now_ist().strftime('%d %b, %Y %I:%M %p IST')} | Concord Engine")
         return embed
 
@@ -944,43 +1546,72 @@ class TaskCog(commands.Cog, name="Tasks"):
         if task_data.get('activity_log'):
             act_log = f"\n\n**Activity Log:**\n{task_data['activity_log'][-1024:]}"
 
+        # Handle notes/remarks display
+        checklist_str = ""
+        if task_data.get('checklist'):
+            note_text = task_data['checklist'].strip()
+            if note_text:
+                checklist_str = f"\n\n**Notes/Remarks:**\n{note_text}"
+
+        # Use title if available, otherwise generate from priority
+        title = task_data.get('title', f"{task_data.get('priority', 'Normal')} Priority Task")
+
+        # Handle deadline display
+        deadline = task_data.get('deadline', '')
+        deadline_display = format_deadline(deadline) if deadline else "⏳ To be set on acknowledge"
+
+        created_at = task_data.get('created_at')
+        posted_str = ""
+        if created_at:
+            try:
+                if hasattr(created_at, 'strftime'):
+                    posted_str = f"\n**Posted:** {created_at.astimezone(IST).strftime('%d %b %Y, %I:%M %p IST')}"
+                else:
+                    posted_str = f"\n**Posted:** {created_at}"
+            except Exception:
+                pass
+
         return f"""
-# 📋 **{task_data['title']}**
-> {task_data['details']}
+# 📋 **{title}**
+> {task_data['details']}{checklist_str}
 
 ---
-**Assigner:** {task_data['assigner']}
-**Deadline:** {format_deadline(task_data['deadline'])}
+**Assigned by:** {task_data['assigner']}{posted_str}
+**Deadline:** {deadline_display}
 **Priority:** {task_data.get('priority', 'Normal')}
 **Global State:** {task_data.get('global_state', 'Active')}
 
-**Assignees & Status:**
+**Assigned to & Status:**
 {roles_list}{act_log}
 """
 
-    # -------------------------------------------------------------------------
-    # Button builders
-    # -------------------------------------------------------------------------
+    # ── View Builders ─────────────────────────────────────────────────────────
+
     async def update_main_task_message(self, task):
         try:
+            task_id = task.get("task_id", "?")
             channel_id = int(task.get("channel_id", 0))
             message_id = task.get("main_message_id")
             if not channel_id or not message_id:
+                logger.warning(f"[Task] update_main_task_message: task {task_id} missing channel_id={channel_id!r} or main_message_id={message_id!r}")
                 return
-                
+
             temp_channel = self.bot.get_channel(channel_id)
             if not temp_channel:
                 try:
                     temp_channel = await self.bot.fetch_channel(channel_id)
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"[Task] update_main_task_message: could not fetch channel {channel_id} for task {task_id}: {e}")
                     return
-                
-            if not temp_channel: # If fetch_channel also failed or returned None
+
+            if not temp_channel:
+                logger.warning(f"[Task] update_main_task_message: channel {channel_id} not found for task {task_id}")
                 return
-                
+
             try:
                 msg = await temp_channel.fetch_message(int(message_id))
             except discord.NotFound:
+                logger.warning(f"[Task] update_main_task_message: message {message_id} not found in channel {channel_id} for task {task_id}")
                 return
             
             # Re-generate markdown representation reflecting current DB state
@@ -1006,27 +1637,56 @@ class TaskCog(commands.Cog, name="Tasks"):
             if task.get("activity_log"):
                 act_log = f"\n\n**Activity Log:**\n{task['activity_log'][-1024:]}"
 
+            # Handle notes/remarks display
+            checklist_str = ""
+            if task.get('checklist'):
+                note_text = task['checklist'].strip()
+                if note_text:
+                    checklist_str = f"\n\n**Notes/Remarks:**\n{note_text}"
+
+            # Use title if available, otherwise generate from priority
+            title = task.get('title', f"{task.get('priority', 'Normal')} Priority Task")
+
+            # Handle deadline display
+            deadline = task.get('deadline', '')
+            deadline_display = format_deadline(deadline) if deadline else "⏳ To be set on acknowledge"
+
+            created_at = task.get('created_at')
+            posted_str = ""
+            if created_at:
+                try:
+                    if hasattr(created_at, 'strftime'):
+                        posted_str = f" · {created_at.astimezone(IST).strftime('%d %b %Y, %I:%M %p IST')}"
+                    else:
+                        posted_str = f" · {created_at}"
+                except Exception:
+                    pass
+
+            assignee_mentions = ", ".join(f"<@{uid}>" for uid in assignee_ids_list)
+            header = (
+                f"📋 **{task.get('priority', 'Normal')} Priority** · Assigned by <@{task['assigner_id']}>{posted_str}\n"
+                f"Assigned to: {assignee_mentions}"
+            )
+
             markdown_content = f"""
-# 📋 **{task['title']}**
-> {task['details']}
+## {title}
+> {task['details']}{checklist_str}
 
----
-**Assigner:** {task['assigner']}
-**Deadline:** {format_deadline(task['deadline'])}
-**Priority:** {task.get('priority', 'Normal')}
-**Global State:** {task.get('global_state', 'Active')}
+**Deadline:** {deadline_display}
 
-**Assignees & Status:**
+**Assignee Status:**
 {roles_list}{act_log}
 """
-                
+
             view = self.get_main_task_view(task)
-            
-            # Since embeds have been dropped, we only pass content bounding
-            await msg.edit(content=f"Task Assignment Created! <@{task['assigner_id']}> assigned this to " + ", ".join(f"<@{uid}>" for uid in assignee_ids_list) + "\n" + markdown_content, embed=None, view=view)
+            full_content = header + "\n" + markdown_content
+            # Discord's message content limit is 2000 characters
+            if len(full_content) > 2000:
+                full_content = full_content[:1997] + "…"
+            await msg.edit(content=full_content, embed=None, view=view)
             
         except Exception as e:
-            logging.error(f"[ERR-TSK-022] [Task] Error updating main task message: {e}")
+            logger.error(f"[ERR-TSK-022] [Task #{task.get('task_id', '?')}] Error updating main task message: {e}")
 
     def get_main_task_view(self, task):
         view = ui.View(timeout=None)
@@ -1046,31 +1706,189 @@ class TaskCog(commands.Cog, name="Tasks"):
         
         ack_label = "[✓] Acknowledged" if all_acknowledged else "Acknowledge Task"
         ack_style = discord.ButtonStyle.green if all_acknowledged else discord.ButtonStyle.primary
-        
-        ack_button = ui.Button(label=ack_label, style=ack_style, custom_id=f"ack_{task['task_id']}", disabled=all_acknowledged)
+
+        ack_button = ui.Button(label=ack_label, style=ack_style, custom_id=f"ack_{task['task_id']}")
         async def ack_cb(i: discord.Interaction):
-            if i.user.id not in assignee_ids_list: # type: ignore
+            if i.user.id not in assignee_ids_list:  # type: ignore
                 return await self._send_ephemeral(i, "You are not an assignee on this task.")
-            
+
             if i.user.id in acknowledged_list:
                 return await self._send_ephemeral(i, "You have already acknowledged this task.")
-                
-            await i.response.defer()
-            acknowledged_list.append(i.user.id) # type: ignore
-            task["acknowledged_by"] = ",".join(map(str, acknowledged_list))
-            
-            await update_task_in_database(task)
-            await self.update_main_task_message(task)
-            
-            # Sync channels immediately
-            await self.sync_user_pending_tasks(int(task.get("assigner_id", 0)), i.guild) # type: ignore
-            await self.sync_user_dashboard_tasks(int(task.get("assigner_id", 0)), i.guild)
-            for uid in assignee_ids_list:
-                await self.sync_user_pending_tasks(int(uid), i.guild)
-                await self.sync_user_dashboard_tasks(int(uid), i.guild)
-                
-            await self._send_ephemeral(i, "You have acknowledged this task.")
-            
+
+            current_deadline = task.get("deadline", "")
+
+            if current_deadline:
+                # Assigner has set a deadline — let assignee accept or propose a different one
+                class AcknowledgeDeadlineView(ui.View):
+                    def __init__(self_view):
+                        super().__init__(timeout=120)
+
+                    @ui.button(label="✅ Accept Deadline", style=discord.ButtonStyle.success)
+                    async def accept_btn(self_view, btn_i: discord.Interaction, button: ui.Button):
+                        try:
+                            await btn_i.response.defer()
+                        except (discord.InteractionResponded, discord.HTTPException):
+                            return
+                        try:
+                            acknowledged_str = task.get("acknowledged_by", "")
+                            ack_list = [int(x) for x in acknowledged_str.split(",") if x]
+                            if i.user.id not in ack_list:
+                                ack_list.append(i.user.id)
+                                task["acknowledged_by"] = ",".join(map(str, ack_list))
+                            ts = now_ist().strftime("%Y-%m-%d %H:%M IST")
+                            task["activity_log"] = (task.get("activity_log") or "") + f"\n[{ts}] {i.user.display_name} acknowledged and accepted deadline: {format_deadline(current_deadline)}"
+                            await update_task_in_database(task)
+                            await self.update_main_task_message(task)
+                            # Notify the task thread
+                            t_chan = self.bot.get_channel(int(task["channel_id"]))
+                            if not t_chan:
+                                try:
+                                    t_chan = await self.bot.fetch_channel(int(task["channel_id"]))
+                                except Exception:
+                                    pass
+                            if t_chan:
+                                await t_chan.send(f"✅ {i.user.mention} acknowledged the task and accepted the deadline: **{format_deadline(current_deadline)}**")
+                            await self._sync_participants(int(task.get("assigner_id", 0)), task.get("assignee_ids", []), btn_i.guild)
+                            await btn_i.edit_original_response(
+                                content=f"✅ Task acknowledged! Deadline accepted: **{format_deadline(current_deadline)}**",
+                                view=None
+                            )
+                            self_view.stop()
+                        except Exception as e:
+                            logger.error(f"[ERR-TSK-030] [Task] accept_btn error: {e}")
+
+                    @ui.button(label="📝 Propose Different Deadline", style=discord.ButtonStyle.secondary)
+                    async def propose_btn(self_view, btn_i: discord.Interaction, button: ui.Button):
+                        class ProposeDeadlineModal(ui.Modal, title="Propose New Deadline"):
+                            proposed_date = ui.TextInput(
+                                label="Proposed Date",
+                                style=discord.TextStyle.short,
+                                placeholder="DD/MM/YYYY  e.g. 27/03/2026",
+                                max_length=10,
+                                required=True
+                            )
+                            proposed_time = ui.TextInput(
+                                label="Proposed Time",
+                                style=discord.TextStyle.short,
+                                placeholder="HH:MM AM/PM  e.g. 02:30 PM",
+                                max_length=8,
+                                required=True
+                            )
+                            async def on_submit(inner_self, mi: discord.Interaction):
+                                try:
+                                    dl_dt, proposed_val = parse_datetime_flexible(
+                                        inner_self.proposed_date.value, inner_self.proposed_time.value
+                                    )
+                                except ValueError as e:
+                                    await mi.response.send_message(f"❌ {e}", ephemeral=True)
+                                    return
+                                if dl_dt.replace(tzinfo=IST) <= now_ist():
+                                    await mi.response.send_message("❌ Proposed deadline must be after the current date and time.", ephemeral=True)
+                                    return
+
+                                await mi.response.defer(ephemeral=True)
+
+                                # Mark assignee as acknowledged (pending deadline approval)
+                                acknowledged_str = task.get("acknowledged_by", "")
+                                ack_list = [int(x) for x in acknowledged_str.split(",") if x]
+                                if i.user.id not in ack_list:
+                                    ack_list.append(i.user.id)
+                                    task["acknowledged_by"] = ",".join(map(str, ack_list))
+
+                                ts = now_ist().strftime("%Y-%m-%d %H:%M IST")
+                                task["activity_log"] = (task.get("activity_log") or "") + f"\n[{ts}] {i.user.display_name} acknowledged but proposed new deadline: {proposed_val} (original: {current_deadline})"
+                                await update_task_in_database(task)
+                                await self.update_main_task_message(task)
+
+                                # Notify assigner in task thread with Accept/Decline buttons
+                                chan = self.bot.get_channel(int(task["channel_id"]))
+                                if not chan:
+                                    try:
+                                        chan = await self.bot.fetch_channel(int(task["channel_id"]))
+                                    except Exception:
+                                        pass
+
+                                if chan:
+                                    deadline_view = ui.View(timeout=None)
+
+                                    accept_dl_btn = ui.Button(label="✅ Accept Proposed Deadline", style=discord.ButtonStyle.success, custom_id=f"approve_deadline_{task['task_id']}")
+                                    async def accept_dl_cb(dl_i: discord.Interaction):
+                                        if dl_i.user.id != task.get("assigner_id"):
+                                            return await self._send_ephemeral(dl_i, "Only the assigner can accept this deadline.")
+                                        await dl_i.response.defer(ephemeral=True)
+                                        task["deadline"] = proposed_val
+                                        ts2 = now_ist().strftime("%Y-%m-%d %H:%M IST")
+                                        task["activity_log"] = (task.get("activity_log") or "") + f"\n[{ts2}] {dl_i.user.display_name} accepted proposed deadline: {proposed_val}"
+                                        await update_task_in_database(task)
+                                        await self.update_main_task_message(task)
+                                        await self._sync_participants(int(task.get("assigner_id", 0)), task.get("assignee_ids", []), dl_i.guild)
+                                        try:
+                                            await dl_i.message.delete()
+                                        except Exception:
+                                            pass
+                                        await dl_i.followup.send(f"✅ Deadline updated to **{format_deadline(proposed_val)}**.", ephemeral=True)
+                                    accept_dl_btn.callback = accept_dl_cb
+
+                                    decline_dl_btn = ui.Button(label="❌ Decline — Keep Original", style=discord.ButtonStyle.danger, custom_id=f"deny_deadline_{task['task_id']}")
+                                    async def decline_dl_cb(dl_i: discord.Interaction):
+                                        if dl_i.user.id != task.get("assigner_id"):
+                                            return await self._send_ephemeral(dl_i, "Only the assigner can decline this request.")
+                                        await dl_i.response.defer(ephemeral=True)
+                                        ts3 = now_ist().strftime("%Y-%m-%d %H:%M IST")
+                                        task["activity_log"] = (task.get("activity_log") or "") + f"\n[{ts3}] {dl_i.user.display_name} declined proposed deadline. Original deadline {current_deadline} stands."
+                                        await update_task_in_database(task)
+                                        await self.update_main_task_message(task)
+                                        await asyncio.gather(
+                                            self.sync_user_dashboard_tasks(int(task.get("assigner_id", 0)), dl_i.guild),
+                                            *[coro for uid in task.get("assignee_ids", []) for coro in (
+                                                self.sync_user_pending_tasks(int(uid), dl_i.guild),
+                                                self.sync_user_dashboard_tasks(int(uid), dl_i.guild),
+                                            )],
+                                        )
+                                        try:
+                                            await dl_i.message.delete()
+                                        except Exception:
+                                            pass
+                                        await dl_i.followup.send(f"❌ Proposed deadline declined. Original deadline **{format_deadline(current_deadline)}** stands.", ephemeral=True)
+                                        # DM the assignee
+                                        try:
+                                            assignee_user = await self.bot.fetch_user(i.user.id)
+                                            await assignee_user.send(f"Your proposed deadline ({format_deadline(proposed_val)}) for task **{task.get('title', 'task')}** was declined by {dl_i.user.display_name}. The original deadline **{format_deadline(current_deadline)}** stands.")
+                                        except Exception:
+                                            pass
+                                    decline_dl_btn.callback = decline_dl_cb
+
+                                    deadline_view.add_item(accept_dl_btn)
+                                    deadline_view.add_item(decline_dl_btn)
+
+                                    await chan.send(
+                                        f"📅 **Deadline Proposal** — {i.user.mention} has acknowledged the task but proposes a new deadline.\n"
+                                        f"**Original:** {format_deadline(current_deadline)}\n"
+                                        f"**Proposed:** {format_deadline(proposed_val)}\n"
+                                        f"<@{task['assigner_id']}> please review:",
+                                        view=deadline_view
+                                    )
+
+                                await self._send_ephemeral(mi, f"📝 Deadline proposal submitted. Awaiting assigner review.\nYou have been acknowledged pending deadline approval.")
+
+                        await btn_i.response.send_modal(ProposeDeadlineModal())
+                        self_view.stop()
+
+                try:
+                    await i.response.send_message(
+                        f"📋 **Task Deadline Set by Assigner:** **{format_deadline(current_deadline)}**\n\nPlease accept this deadline or propose a different one:",
+                        view=AcknowledgeDeadlineView(),
+                        ephemeral=True
+                    )
+                except (discord.InteractionResponded, discord.HTTPException):
+                    return  # Live view already responded
+            else:
+                # No deadline set — assignee proposes one
+                try:
+                    await i.response.send_modal(AssigneeDeadlineModal(task, i.user.id))
+                except (discord.InteractionResponded, discord.HTTPException):
+                    return  # Live view already responded
+
         ack_button.callback = ack_cb
         
         # Mark Complete Button
@@ -1089,7 +1907,10 @@ class TaskCog(commands.Cog, name="Tasks"):
             except ValueError:
                 return await self._send_ephemeral(i, "Call [ERR-TSK-023]: Error retrieving your assignee status.")
                 
-            await i.response.defer()
+            try:
+                await i.response.defer()
+            except (discord.InteractionResponded, discord.HTTPException):
+                return  # Live view already responded
             completion_vector[user_idx] = "1"
             task["completion_vector"] = ",".join(completion_vector)
             
@@ -1098,54 +1919,55 @@ class TaskCog(commands.Cog, name="Tasks"):
                 task["status"] = "Pending Assigner Review"
                 temp_channel = self.bot.get_channel(int(task["channel_id"]))
                 if temp_channel:
-                    await temp_channel.send(f"✅ All assignees have completed their work! Assigner, please review.")
+                    await temp_channel.send(f"✅ {', '.join(task.get('assignees', []))} have completed their work! {task.get('assigner', 'Assigner')}, please review.")
                     
             await update_task_in_database(task)
             await self.update_main_task_message(task)
             await self._send_ephemeral(i, "Your portion of the task has been marked complete.")
             
-            await self.sync_user_pending_tasks(int(task.get("assigner_id", 0)), i.guild) # type: ignore
-            await self.sync_user_dashboard_tasks(int(task.get("assigner_id", 0)), i.guild)
-            for uid in task.get("assignee_ids", []):
-                await self.sync_user_pending_tasks(int(uid), i.guild)
-                await self.sync_user_dashboard_tasks(int(uid), i.guild)
-                
+            await self._sync_participants(int(task.get("assigner_id", 0)), task.get("assignee_ids", []), i.guild)
+
         mark_complete_button.callback = mark_complete_cb
         
         if global_state == "Active":
-            view.add_item(ack_button)
-            # Only show mark complete if at least one person has acknowledged
-            if len(acknowledged_list) > 0:
-                view.add_item(mark_complete_button)
+            if not all_acknowledged:
+                view.add_item(ack_button)
+                
+            if task.get("status") == "Blocked":
+                view.add_item(ui.Button(label="Resolve Blocker", style=discord.ButtonStyle.success, custom_id=f"dash_resolve_block_{task['task_id']}"))
+                view.add_item(ui.Button(label="Request New Deadline", style=discord.ButtonStyle.secondary, custom_id=f"dash_req_deadline_{task['task_id']}"))
+            else:
+                view.add_item(ui.Button(label="Reject Task", style=discord.ButtonStyle.danger, custom_id=f"dash_reject_{task['task_id']}"))
+                
+                # Only show mark complete if at least one person has acknowledged
+                if len(acknowledged_list) > 0:
+                    view.add_item(mark_complete_button)
         elif global_state == "Pending Review":
             approve_btn = ui.Button(label="Approve Task", style=discord.ButtonStyle.success, custom_id=f"approve_panel_{task['task_id']}")
             async def approve_cb(i: discord.Interaction):
                 if i.user.id != task.get("assigner_id"):
-                    return await self._send_ephemeral(i, "Only the assigner can approve this task.")
+                    return await self._send_ephemeral(i, f"Only {task.get('assigner', 'the assigner')} can approve this task.")
+                await i.response.defer(ephemeral=True)
                 await mark_task_completed(int(task["task_id"]))
-                
-                # Update local state for immediate UI refresh
+
                 task["global_state"] = "Finalized"
                 task["status"] = "Finalized"
-                
+
                 temp_channel = self.bot.get_channel(int(task["channel_id"]))
                 if temp_channel:
                     await temp_channel.send(f"✅ **Task Approved.** This channel will be automatically archived in 24 hours.")
-                
+
                 await self.update_main_task_message(task)
-                
-                await self.sync_user_pending_tasks(task["assigner_id"], i.guild)
-                await self.sync_user_dashboard_tasks(task["assigner_id"], i.guild)
-                for uid in task.get("assignee_ids", []):
-                    await self.sync_user_pending_tasks(uid, i.guild)
-                    await self.sync_user_dashboard_tasks(uid, i.guild)
+
+                await self._sync_participants(task["assigner_id"], task.get("assignee_ids", []), i.guild)
+                await i.followup.send("✅ Task approved and finalized.", ephemeral=True)
             approve_btn.callback = approve_cb
             view.add_item(approve_btn)
 
             revise_btn = ui.Button(label="Request Revision", style=discord.ButtonStyle.danger, custom_id=f"revise_panel_{task['task_id']}")
             async def revise_cb(i: discord.Interaction):
                 if i.user.id != task.get("assigner_id"):
-                    return await self._send_ephemeral(i, "Only the assigner can request a revision.")
+                    return await self._send_ephemeral(i, f"Only {task.get('assigner', 'the assigner')} can request a revision.")
                 class RevisionModal(ui.Modal, title="Request Revision"):
                     feedback = ui.TextInput(label="Feedback", style=discord.TextStyle.long, required=True, placeholder="What needs to be fixed?")
                     async def on_submit(inner_self, modal_interaction: discord.Interaction):
@@ -1155,26 +1977,23 @@ class TaskCog(commands.Cog, name="Tasks"):
                         
                         num_assignees = len(task.get("assignee_ids", []))
                         task["completion_vector"] = ",".join(["0"] * num_assignees)
+                        task["acknowledged_by"] = ""
                         
                         current_log = task.get("activity_log", "")
                         timestamp = now_ist().strftime("%Y-%m-%d %H:%M IST")
-                        new_entry = f"[{timestamp}] Assigner requested revision: {inner_self.feedback.value}"
+                        new_entry = f"[{timestamp}] {task.get('assigner', 'Assigner')} requested revision: {inner_self.feedback.value}"
                         task["activity_log"] = f"{current_log}\n{new_entry}" if current_log else new_entry
                         
                         await update_task_in_database(task)
                         
                         temp_channel = self.bot.get_channel(int(task["channel_id"]))
                         if temp_channel:
-                            await temp_channel.send(f"⚠️ **Revision Requested by Assigner:**\n{inner_self.feedback.value}")
+                            await temp_channel.send(f"⚠️ **Revision Requested by {task.get('assigner', 'Assigner')}:**\n{inner_self.feedback.value}")
                         
                         await self.update_main_task_message(task)
                         await self._send_ephemeral(modal_interaction, "Revision requested and completion statuses reset.")
                         
-                        await self.sync_user_pending_tasks(int(task.get("assigner_id", 0)), modal_interaction.guild)
-                        await self.sync_user_dashboard_tasks(int(task.get("assigner_id", 0)), modal_interaction.guild)
-                        for uid in task.get("assignee_ids", []):
-                            await self.sync_user_pending_tasks(int(uid), modal_interaction.guild)
-                            await self.sync_user_dashboard_tasks(int(uid), modal_interaction.guild)
+                        await self._sync_participants(int(task.get("assigner_id", 0)), task.get("assignee_ids", []), modal_interaction.guild)
                 await i.response.send_modal(RevisionModal())
             revise_btn.callback = revise_cb
             view.add_item(revise_btn)
@@ -1183,21 +2002,24 @@ class TaskCog(commands.Cog, name="Tasks"):
         # ASSIGNER BUTTONS
         # ----------------------------------------------------
         
-        manage_btn = ui.Button(label="Manage Task ⚙️", style=discord.ButtonStyle.secondary, custom_id=f"manage_{task['task_id']}")
-        async def manage_cb(i: discord.Interaction):
-            try:
-                if i.user.id != task.get("assigner_id"):
-                    return await self._send_ephemeral(i, "Only the assigner can manage this task.")
+        if global_state != "Finalized":
+            manage_btn = ui.Button(label="Manage Task ⚙️", style=discord.ButtonStyle.secondary, custom_id=f"manage_{task['task_id']}")
+            async def manage_cb(i: discord.Interaction):
+                try:
+                    if i.user.id != task.get("assigner_id"):
+                        return await self._send_ephemeral(i, f"Only {task.get('assigner', 'the assigner')} can manage this task.")
+
+                    try:
+                        await i.response.defer(ephemeral=True)
+                    except (discord.InteractionResponded, discord.HTTPException):
+                        return  # Live view already responded — silently drop the duplicate
+                    control_view = self.get_assigner_control_view(task)
+                    await i.followup.send("⚙️ **Assigner Control Panel**", view=control_view, ephemeral=True)
+                except Exception as e:
+                    logger.error(f"[ERR-TSK-024] [Task] manage_cb error: {e}")
                 
-                await i.response.defer(ephemeral=True)
-                control_view = self.get_assigner_control_view(task)
-                await i.followup.send("⚙️ **Assigner Control Panel**", view=control_view, ephemeral=True)
-            except Exception as e:
-                import logging
-                logging.error(f"[ERR-TSK-024] [Task] manage_cb error: {e}")
-            
-        manage_btn.callback = manage_cb
-        view.add_item(manage_btn)
+            manage_btn.callback = manage_cb
+            view.add_item(manage_btn)
 
         return view
 
@@ -1217,23 +2039,32 @@ class TaskCog(commands.Cog, name="Tasks"):
                     guild = select_interaction.guild
                     if not guild: return
                     temp_channel = guild.get_channel(int(task["channel_id"]))
-                    if not temp_channel: return
-                    
+                    if not temp_channel:
+                        try:
+                            temp_channel = await self_cog.bot.fetch_channel(int(task["channel_id"]))
+                        except Exception:
+                            return
+
                     existing_ids = task.get("assignee_ids", [])
                     completion_str = task.get("completion_vector", "")
                     completion_vector = completion_str.split(",") if completion_str else ["0"] * len(existing_ids)
-                    
+
                     for user in new_users:
                         if user.id not in existing_ids: # type: ignore
                             existing_ids.append(user.id) # type: ignore
                             task.get("assignees", []).append(user.display_name) # type: ignore
                             completion_vector.append("0")
                             added.append(user)
-                            # Grant channel access
-                            if isinstance(temp_channel, discord.Thread):
-                                await temp_channel.add_user(user)
-                            else:
-                                await temp_channel.set_permissions(user, read_messages=True, send_messages=True)
+                            # Grant read-only access to the task channel
+                            await temp_channel.set_permissions(
+                                user, view_channel=True, send_messages=False,
+                                read_message_history=True, add_reactions=False,
+                                create_public_threads=False, create_private_threads=False
+                            )
+                            # Also add to the discussion thread
+                            discussion_thread = discord.utils.get(temp_channel.threads, name="💬 Discussion")
+                            if discussion_thread:
+                                await discussion_thread.add_user(user)
                             
                     if added:
                         task["completion_vector"] = ",".join(completion_vector)
@@ -1243,10 +2074,13 @@ class TaskCog(commands.Cog, name="Tasks"):
                         mentions = " ".join([u.mention for u in added])
                         await temp_channel.send(f"👥 **New Assignees Added:** {mentions} Welcome to the task!")
                         
-                        for u in added:
-                            await self.sync_user_pending_tasks(u.id, guild)
-                            await self.sync_user_dashboard_tasks(u.id, guild)
-                        await self.sync_user_dashboard_tasks(select_interaction.user.id, guild)
+                        await asyncio.gather(
+                            *[coro for u in added for coro in (
+                                self.sync_user_pending_tasks(u.id, guild),
+                                self.sync_user_dashboard_tasks(u.id, guild),
+                            )],
+                            self.sync_user_dashboard_tasks(select_interaction.user.id, guild),
+                        )
                         await self._send_ephemeral(select_interaction, f"Successfully added {len(added)} new assignees.")
                     else:
                         await self_cog._send_ephemeral(select_interaction, "No new assignees were added (they might already be assigned).")
@@ -1272,26 +2106,26 @@ class TaskCog(commands.Cog, name="Tasks"):
             
             await self_cog.update_main_task_message(task)
             
-            await self_cog.sync_user_pending_tasks(int(task.get("assigner_id", 0)), i.guild) # type: ignore
-            await self_cog.sync_user_dashboard_tasks(int(task.get("assigner_id", 0)), i.guild)
-            for uid in task.get("assignee_ids", []):
-                await self_cog.sync_user_pending_tasks(int(uid), i.guild)
-                await self_cog.sync_user_dashboard_tasks(int(uid), i.guild)
+            await self_cog._sync_participants(int(task.get("assigner_id", 0)), task.get("assignee_ids", []), i.guild)
         complete_button.callback = complete_cb
         view.add_item(complete_button)
         
         modify_button = ui.Button(label="Modify Deadline", style=discord.ButtonStyle.secondary, custom_id=f"modify_deadline_panel_{task['task_id']}")
         async def modify_cb(i: discord.Interaction):
             class ModifyDeadlineModal(ui.Modal, title="Modify Deadline"):
-                new_deadline = ui.TextInput(label="New Deadline", style=discord.TextStyle.short, placeholder="DD/MM/YYYY HH:MM AM/PM", required=True)
+                new_deadline_date = ui.TextInput(label="New Deadline Date", style=discord.TextStyle.short, placeholder="DD/MM/YYYY  e.g. 27/03/2026", max_length=10, required=True)
+                new_deadline_time = ui.TextInput(label="New Deadline Time", style=discord.TextStyle.short, placeholder="HH:MM AM/PM  e.g. 02:30 PM", max_length=8, required=True)
                 async def on_submit(inner_self, modal_interaction: discord.Interaction):
                     await modal_interaction.response.defer(ephemeral=True)
-                    new_val = inner_self.new_deadline.value.strip()
                     try:
-                        from datetime import datetime
-                        datetime.strptime(new_val, "%d/%m/%Y %I:%M %p")
-                    except ValueError:
-                        await self_cog._send_ephemeral(modal_interaction, "❌ Call [ERR-TSK-025]: Invalid format. Please use `DD/MM/YYYY HH:MM AM/PM` (e.g. `27/10/2026 05:00 PM`)")
+                        dl_dt, new_val = parse_datetime_flexible(
+                            inner_self.new_deadline_date.value, inner_self.new_deadline_time.value
+                        )
+                    except ValueError as e:
+                        await self_cog._send_ephemeral(modal_interaction, f"❌ [ERR-TSK-025] {e}")
+                        return
+                    if dl_dt.replace(tzinfo=IST) <= now_ist():
+                        await self_cog._send_ephemeral(modal_interaction, "❌ Deadline must be after the current date and time.")
                         return
 
                     task["deadline"] = new_val
@@ -1300,11 +2134,7 @@ class TaskCog(commands.Cog, name="Tasks"):
                     await self_cog.update_main_task_message(task)
                     await self_cog._send_ephemeral(modal_interaction, "Deadline updated.")
                     
-                    await self_cog.sync_user_pending_tasks(int(task.get("assigner_id", 0)), modal_interaction.guild) # type: ignore
-                    await self_cog.sync_user_dashboard_tasks(int(task.get("assigner_id", 0)), modal_interaction.guild)
-                    for uid in task.get("assignee_ids", []):
-                        await self_cog.sync_user_pending_tasks(int(uid), modal_interaction.guild)
-                        await self_cog.sync_user_dashboard_tasks(int(uid), modal_interaction.guild)
+                    await self_cog._sync_participants(int(task.get("assigner_id", 0)), task.get("assignee_ids", []), modal_interaction.guild)
             await i.response.send_modal(ModifyDeadlineModal())
         modify_button.callback = modify_cb
         view.add_item(modify_button)
@@ -1321,18 +2151,16 @@ class TaskCog(commands.Cog, name="Tasks"):
 
         return view
 
+    # ── Background Engines ────────────────────────────────────────────────────
+
     async def check_and_remove_invalid_tasks(self):
         await self.bot.wait_until_ready()
         while True:
             try:
-                # In the new PostgreSQL schema, we don't have a direct 'list all pending channels' method.
-                # Cleanup is now performed during user interaction or manual sync to ensure consistency.
-                # This loop is kept as a heartbeat but remains idle for now.
-                pass 
-                
+                await cleanup_stale_drafts(max_age_hours=24)
             except Exception as e:
-                logging.error(f"[ERR-TSK-026] [Task] Error in check_and_remove_invalid_tasks: {e}")
-            await asyncio.sleep(300) # Poll every 5 mins
+                logger.error(f"[ERR-TSK-026] [Task] Error in check_and_remove_invalid_tasks: {e}")
+            await asyncio.sleep(300)  # Every 5 minutes
 
     # -------------------------------------------------------------------------
     # Reminder Engine
@@ -1347,10 +2175,14 @@ class TaskCog(commands.Cog, name="Tasks"):
                 if self.is_active_window():
                     from Bots.db_managers.task_db_manager import db_execute, get_conn
                     def _get_queue():
-                        with get_conn() as conn:
+                        from Bots.db_managers.task_db_manager import get_conn, put_conn
+                        conn = get_conn()
+                        try:
                             with conn.cursor() as cur:
                                 cur.execute("SELECT * FROM notification_queue WHERE sent = FALSE")
                                 return cur.fetchall()
+                        finally:
+                            put_conn(conn)
                     
                     queued = await db_execute(_get_queue)
                     for q in queued:
@@ -1360,21 +2192,23 @@ class TaskCog(commands.Cog, name="Tasks"):
                                 await user.send(f"🌅 **Morning Update:** {q['content']}")
                             
                             def _mark_sent(qid=q['id']):
-                                with get_conn() as conn:
+                                from Bots.db_managers.task_db_manager import get_conn, put_conn
+                                conn = get_conn()
+                                try:
                                     with conn.cursor() as cur:
                                         cur.execute("UPDATE notification_queue SET sent = TRUE WHERE id = %s", (qid,))
                                     conn.commit()
+                                finally:
+                                    put_conn(conn)
                             await db_execute(_mark_sent)
                         except Exception as e:
-                            logging.error(f"[ERR-TSK-027] [Task Queue] Failed delivery of {q['id']}: {e}")
+                            logger.error(f"[ERR-TSK-027] [Task Queue] Failed delivery of {q['id']}: {e}")
 
                 # 2. Main Logic Process
-                tasks = await retrieve_all_tasks_from_database()
+                tasks = await retrieve_active_tasks_from_database()
                 now = datetime.now(IST)
-                
+
                 for task in tasks:
-                    if task.get("global_state", "Active") != "Active":
-                        continue
                     if task.get("status") == "Blocked":
                         # Blocker Protocol: Pause assignee nags, nag assigner
                         # Implementation detail: Skip the normal flow and maybe add a special assigner nag
@@ -1395,16 +2229,17 @@ class TaskCog(commands.Cog, name="Tasks"):
                     sent_list = reminders_sent.split(",") if reminders_sent else []
                     
                     triggers = [] # format: (slug, message, target_ids)
-                    
+                    task_title = task.get('title', f"{task.get('priority', 'Normal')} Priority Task")
+
                     # Logic Mapping from concord_logic.txt
                     if priority == "High":
                         if hours_diff <= 24 and "24h" not in sent_list:
-                            triggers.append(("24h", f"⚠️ **Urgent Nudge:** Task **{task['title']}** is due in 24 hours.", task['assignee_ids']))
+                            triggers.append(("24h", f"⚠️ **Urgent Nudge:** Task **{task_title}** is due in 24 hours.", task['assignee_ids']))
                         if hours_diff <= 4 and "4h" not in sent_list:
-                            triggers.append(("4h", f"🚨 **Priority Alert:** Task **{task['title']}** is due in just 4 hours!", task['assignee_ids']))
+                            triggers.append(("4h", f"🚨 **Priority Alert:** Task **{task_title}** is due in just 4 hours!", task['assignee_ids']))
                         if hours_diff <= 1 and "1h_thread" not in sent_list:
                             triggers.append(("1h_thread", "⏰ **Final Hour:** Task is due in 1 hour.", "thread"))
-                        
+
                         # Overdue logic (+15m grace)
                         if hours_diff <= -0.25: # exceeds 15m
                             if "0m_overdue" not in sent_list:
@@ -1414,24 +2249,12 @@ class TaskCog(commands.Cog, name="Tasks"):
                             if hours_diff <= -4.0 and "4h_esc" not in sent_list:
                                 triggers.append(("4h_esc", "🔥 **Critical Escalation (4h):** Assigning Project Manager attention.", "esc_pm"))
 
-                    elif priority == "Medium":
-                        if hours_diff <= 24 and "24h" not in sent_list:
-                            triggers.append(("24h", f"📅 **Reminder:** Task **{task['title']}** due in 24 hours.", task['assignee_ids']))
-                        if hours_diff <= 2 and "2h" not in sent_list:
-                            triggers.append(("2h", f"🔔 **Final Alert:** Task **{task['title']}** due in 2 hours.", task['assignee_ids']))
-
-                        if hours_diff <= -0.25: # exceeds 15m
-                            if "0m_overdue" not in sent_list:
-                                triggers.append(("0m_overdue", "❌ **Overdue:** Deadline passed.", "thread"))
-                            if hours_diff <= -4.0 and "4h_overdue" not in sent_list:
-                                triggers.append(("4h_overdue", "⚠️ **Still Overdue:** 4 hours past deadline.", "thread_and_assigner"))
-                            if hours_diff <= -24.0 and "24h_esc" not in sent_list:
-                                triggers.append(("24h_esc", "📡 **Escalation (24h):** Notifying Department Manager.", "esc_dept"))
+                        # Removed Medium logic per request
 
                     elif priority == "Normal":
                         if hours_diff <= 24 and "24h" not in sent_list:
-                            triggers.append(("24h", f"📌 **Task Nudge:** **{task['title']}** due in 24 hours.", task['assignee_ids']))
-                        
+                            triggers.append(("24h", f"📌 **Task Nudge:** **{task_title}** due in 24 hours.", task['assignee_ids']))
+
                         if hours_diff <= -0.25: # exceeds 15m
                             if "0m_overdue" not in sent_list:
                                 triggers.append(("0m_overdue", "❌ **Deadline Passed.**", "thread"))
@@ -1440,14 +2263,16 @@ class TaskCog(commands.Cog, name="Tasks"):
 
                     elif priority == "Low":
                         if hours_diff <= 48 and "48h" not in sent_list:
-                            triggers.append(("48h", f"📎 **Upcoming:** **{task['title']}** due in 48 hours.", task['assignee_ids']))
+                            triggers.append(("48h", f"📎 **Upcoming:** **{task_title}** due in 48 hours.", task['assignee_ids']))
 
-                    # Execute Triggers
-                    for slug, content, target in triggers:
-                        sent_list.append(slug)
+                    # Execute Triggers — collect all slugs first, write DB once
+                    if triggers:
+                        for slug, _, __ in triggers:
+                            sent_list.append(slug)
                         task["reminders_sent"] = ",".join(sent_list)
                         await update_task_in_database(task)
-                        
+
+                    for slug, content, target in triggers:
                         # Routing logic
                         chan = self.bot.get_channel(int(task['channel_id']))
                         if not chan:
@@ -1458,34 +2283,78 @@ class TaskCog(commands.Cog, name="Tasks"):
                         
                         if target == "thread" or target == "thread_and_assigner":
                             if chan:
-                                # Get mentions
                                 assignee_mentions = " ".join([f"<@{uid}>" for uid in task['assignee_ids']])
                                 final_msg = f"{assignee_mentions} {content}"
                                 if target == "thread_and_assigner":
                                     final_msg += f" <@{task['assigner_id']}>"
                                 await chan.send(final_msg)
-                        elif target == "esc_dept":
-                            # Use mapping from DEPARTMENTS if applicable, or logic for identifying dept mgr
-                            # For now, let's look for a role with name mapping or default log
-                            logging.warning(f"[ERR-TSK-028] [Escalation] Task {task['task_id']} escalated to Dept Manager.")
-                            if chan: await chan.send(f"📡 **Department Manager alerted.**")
+                        elif target in ("esc_dept", "esc_pm"):
+                            if chan:
+                                guild = chan.guild
+                                assignee_mentions = " ".join([f"<@{uid}>" for uid in task['assignee_ids']])
+                                task_label = task.get('title', f"Task #{task['task_id']}")
+                                ping = None
+                                if target == "esc_dept":
+                                    # Find the assigner's department role
+                                    assigner_member = guild.get_member(int(task.get("assigner_id", 0)))
+                                    if assigner_member:
+                                        for role in assigner_member.roles:
+                                            if role.id in DEPARTMENTS.values():
+                                                ping = role.mention
+                                                break
+                                    if not ping:
+                                        ping = f"<@{task['assigner_id']}>"
+                                    await chan.send(
+                                        f"📡 **Dept Escalation:** {ping} — **{task_label}** assigned to "
+                                        f"{assignee_mentions} is overdue and requires your attention."
+                                    )
+                                    logger.warning(f"[ERR-TSK-028] [Escalation] Task {task['task_id']} escalated to dept ({ping}).")
+                                else:  # esc_pm
+                                    pm_role = discord.utils.get(guild.roles, name="Project Coordinator")
+                                    ping = pm_role.mention if pm_role else f"<@{task['assigner_id']}>"
+                                    await chan.send(
+                                        f"🔥 **PM Escalation:** {ping} — **{task_label}** is critically overdue. "
+                                        f"Assigner: <@{task['assigner_id']}>, Assignees: {assignee_mentions}"
+                                    )
+                                    logger.warning(f"[ERR-TSK-028] [Escalation] Task {task['task_id']} escalated to PM ({ping}).")
                         elif isinstance(target, list):
-                            # DM Target
+                            # Build a rich DM with task details and a direct thread link
+                            desc = task.get('details', '')
+                            desc_preview = desc[:200] + ('…' if len(desc) > 200 else '')
+                            dl_display = format_deadline(task.get('deadline', '')) if task.get('deadline') else 'Not set'
+                            thread_link = ""
+                            if chan:
+                                if task.get('main_message_id'):
+                                    thread_link = f"\n🔗 https://discord.com/channels/{chan.guild.id}/{task['channel_id']}/{task['main_message_id']}"
+                                else:
+                                    thread_link = f"\n🔗 https://discord.com/channels/{chan.guild.id}/{task['channel_id']}"
+                            rich_content = (
+                                f"{content}\n\n"
+                                f"**Task:** {task_title}\n"
+                                f"**Description:** {desc_preview}\n"
+                                f"**Deadline:** {dl_display}\n"
+                                f"**Priority:** {task.get('priority', 'Normal')}\n"
+                                f"**Assigned by:** {task.get('assigner', 'Unknown')}"
+                                f"{thread_link}"
+                            )
                             for uid in target:
-                                await self.deliver_notification(task['task_id'], int(uid), content)
+                                await self.deliver_notification(task['task_id'], int(uid), rich_content)
 
                 # End Main Logic
             except Exception as e:
-                logging.error(f"[ERR-TSK-029] [Task] Error in task_reminder_engine: {e}")
+                logger.error(f"[ERR-TSK-029] [Task] Error in task_reminder_engine: {e}")
                 
             await asyncio.sleep(60 * 5) # Poll every 5 minutes
+
+    # ── Archiving ─────────────────────────────────────────────────────────────
 
     async def archive_task_channel(self, task, channel: discord.TextChannel):
         import os
         import json as _json
 
         archive_root = os.getenv("ARCHIVE_PATH", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Archives", "Tasks"))
-        safe_title = "".join([c for c in task['title'] if c.isalpha() or c.isdigit() or c in (' ', '-', '_')]).rstrip()
+        task_title = task.get('title', f"Task {task.get('task_id', 'Unknown')}")
+        safe_title = "".join([c for c in task_title if c.isalpha() or c.isdigit() or c in (' ', '-', '_')]).rstrip()
         task_dir = os.path.join(archive_root, f"{safe_title}_{task['task_id']}")
         os.makedirs(task_dir, exist_ok=True)
 
@@ -1500,7 +2369,8 @@ class TaskCog(commands.Cog, name="Tasks"):
         transcript_path = os.path.join(task_dir, "transcript.txt")
         try:
             with open(transcript_path, "w", encoding="utf-8") as f:
-                f.write(f"--- Task Transcript: {task['title']} ---\n")
+                task_title = task.get('title', f"Task {task.get('task_id', 'Unknown')}")
+                f.write(f"--- Task Transcript: {task_title} ---\n")
                 f.write(f"Assigner: {task['assigner']} | Deadline: {task['deadline']}\n")
                 f.write(f"Assignees: {', '.join(task.get('assignees', []))}\n")
                 f.write(f"Archived: {now_ist().strftime('%d %b, %Y %I:%M %p IST')}\n")
@@ -1528,7 +2398,7 @@ class TaskCog(commands.Cog, name="Tasks"):
                             f.write(f"  -> [SKIPPED: {skip_reason}]\n")
                             f.write(f"  -> [Manual retrieval URL: {attachment.url}]\n")
                             skipped_attachments.append({"filename": attachment.filename, "size": attachment.size, "url": attachment.url, "reason": skip_reason})
-                            logging.warning(f"[ERR-TSK-030] [Task Archive] Skipped attachment: {attachment.filename} — {skip_reason}")
+                            logger.warning(f"[ERR-TSK-030] [Task Archive] Skipped attachment: {attachment.filename} — {skip_reason}")
                             continue
 
                         safe_filename = f"{message.id}_{count}_{attachment.filename}"
@@ -1539,10 +2409,22 @@ class TaskCog(commands.Cog, name="Tasks"):
                             cumulative_bytes += actual_size
                             saved_attachments.append({"filename": safe_filename, "size": actual_size})
                         except Exception as file_err:
-                            logging.error(f"[ERR-TSK-031] [Task Archive] Failed to download attachment {attachment.filename}: {file_err}")
+                            logger.error(f"[ERR-TSK-031] [Task Archive] Failed to download attachment {attachment.filename}: {file_err}")
                             f.write(f"  -> [Error saving attachment]\n")
                             skipped_attachments.append({"filename": attachment.filename, "size": attachment.size, "url": attachment.url, "reason": f"download error: {file_err}"})
                     f.write("\n")
+
+                # Also archive the discussion thread
+                discussion_thread = discord.utils.get(channel.threads, name="💬 Discussion")
+                if discussion_thread:
+                    f.write("\n--- 💬 Discussion Thread ---\n\n")
+                    async for message in discussion_thread.history(limit=None, oldest_first=True):
+                        ts_ist = message.created_at.replace(tzinfo=timezone.utc).astimezone(IST)
+                        ts = ts_ist.strftime("%Y-%m-%d %H:%M:%S IST")
+                        f.write(f"[{ts}] {message.author.display_name}:\n{message.clean_content}\n")
+                        for attachment in message.attachments:
+                            f.write(f"  -> [Attachment: {attachment.filename}]\n")
+                        f.write("\n")
 
             # Write archive manifest
             manifest = {
@@ -1560,37 +2442,13 @@ class TaskCog(commands.Cog, name="Tasks"):
             with open(manifest_path, "w", encoding="utf-8") as mf:
                 _json.dump(manifest, mf, indent=2, ensure_ascii=False)
 
-            logging.info(f"[Task Archive] Successfully archived '{task['title']}' to {task_dir} "
+            task_title = task.get('title', f"Task {task.get('task_id', 'Unknown')}")
+            logger.info(f"[Task Archive] Successfully archived '{task_title}' to {task_dir} "
                          f"(saved: {len(saved_attachments)}, skipped: {len(skipped_attachments)}, "
                          f"total: {cumulative_bytes / (1024*1024):.1f} MB)")
         except Exception as e:
-            logging.error(f"[ERR-TSK-032] [Task Archive] Failed to archive channel history: {e}")
+            logger.error(f"[ERR-TSK-032] [Task Archive] Failed to archive channel history: {e}")
 
-    # -------------------------------------------------------------------------
-    # Commands
-    # -------------------------------------------------------------------------
-
-    @commands.command(name="view_tasks")
-    async def view_tasks_cmd(self, ctx):
-        """Lists all pending tasks."""
-        try:
-            tasks = await retrieve_all_tasks_from_database()
-            if not tasks:
-                await ctx.send("No pending tasks found.")
-                return
-            for task in tasks:
-                embed = discord.Embed(title="Pending Task", color=0x00FF00)
-                channel = self.bot.get_channel(task["channel_id"])
-                ch_name = channel.name if channel else f"Channel ID {task['channel_id']}"
-                assignees = ", ".join(task["assignees"])
-                embed.add_field(name=f"Task in {ch_name}", value=f"**Assignees:** {assignees}\n**Details:** {task['details']}\n**Deadline:** {task['deadline']}", inline=False)
-                view = await self.handle_task_buttons(ctx, task)
-                if view:
-                    await ctx.send(embed=embed, view=view)
-                else:
-                    await ctx.send(embed=embed)
-        except Exception as e:
-            await ctx.send(f"An error occurred: {e}")
 
 
 async def setup(bot: commands.Bot):

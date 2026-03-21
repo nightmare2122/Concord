@@ -5,12 +5,13 @@ from dotenv import load_dotenv
 import sys
 
 # Add project root to sys.path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Bots'))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from db_managers.task_db_manager import initialize_task_db
-from db_managers.leave_db_manager import initialize_leave_db
-from db_managers.discovery_db_manager import _initialize_discovery_db_sync
+from Bots.db_managers.task_db_manager import initialize_task_db
+from Bots.db_managers.leave_db_manager import initialize_leave_db
+from Bots.db_managers.discovery_db_manager import _initialize_discovery_db_sync
 
 load_dotenv()
 

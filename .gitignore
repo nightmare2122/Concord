@@ -16,6 +16,10 @@ Database/
 *.db-shm
 *.db-wal
 
+# Runtime directories (auto-created by run.sh)
+Logs/
+Archives/
+
 # IDE / Editor
 .vscode/
 .pyre_configuration
@@ -33,3 +37,7 @@ tests/__pycache__/
 Bots/__pycache__/
 Bots/db_managers/__pycache__/
 cogs/__pycache__/
+.pytest_cache/
+
+# Sensitive credentials — never commit
+Config/

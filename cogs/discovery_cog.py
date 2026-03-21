@@ -12,9 +12,11 @@ class DiscoveryCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.bg_task = None
+        self._sweep_task = None
+        self._cleanup_task = None
 
     async def cog_load(self):
-        self.bg_task = self.bot.loop.create_task(db.db_worker())
+        self.bg_task = asyncio.create_task(db.db_worker())
         await db.initialize_discovery_db()
         # Initialize the global discovery event
         if not hasattr(self.bot, 'discovery_complete'):
@@ -22,14 +24,15 @@ class DiscoveryCog(commands.Cog):
         self.bot.discovery_complete.clear()
 
     async def cog_unload(self):
-        if self.bg_task:
-            self.bg_task.cancel()
+        for task in (self.bg_task, self._sweep_task, self._cleanup_task):
+            if task:
+                task.cancel()
 
     # ─── Initial Full Sweep ───────────────────────────────────────────────────
 
     @commands.Cog.listener()
     async def on_ready(self):
-        logger.info("[Discovery] [Discovery] Starting initial server analysis...")
+        logger.info("[Discovery] Starting initial server analysis...")
         for guild in self.bot.guilds:
             for category in guild.categories:
                 await db.upsert_category(category.id, category.name)
@@ -44,7 +47,7 @@ class DiscoveryCog(commands.Cog):
             async for member in guild.fetch_members(limit=None):
                 role_names = [r.name for r in member.roles if r.name != '@everyone']
                 await db.upsert_member(member.id, member.name, member.display_name, member.joined_at, roles=role_names)
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.1)  # Rate limit: 10 members/sec to avoid API limits
 
             for event in guild.scheduled_events:
                 await db.upsert_scheduled_event(
@@ -53,7 +56,8 @@ class DiscoveryCog(commands.Cog):
                 )
 
         # Kick off async message sweeping so we don't block on_ready
-        self.bot.loop.create_task(self._sweep_messages())
+        self._sweep_task = asyncio.create_task(self._sweep_messages())
+        self._cleanup_task = asyncio.create_task(self._message_cleanup_engine())
 
         logger.info("[Discovery] Initial server discovery complete.")
         self.bot.discovery_complete.set()
@@ -77,6 +81,16 @@ class DiscoveryCog(commands.Cog):
                 except Exception as e:
                     logger.error(f"[ERR-DSC-001] [Discovery] Error sweeping #{channel.name}: {e}")
         logger.info("[Discovery] Background message sweep complete.")
+
+    async def _message_cleanup_engine(self):
+        """Runs once daily to prune the messages table, keeping the 5000 most recent entries."""
+        await self.bot.wait_until_ready()
+        while not self.bot.is_closed():
+            await asyncio.sleep(86400)  # 24 hours
+            try:
+                await db.cleanup_old_messages(keep=5000)
+            except Exception as e:
+                logger.error(f"[ERR-DSC-002] [Discovery] Message cleanup error: {e}")
 
     # ─── Category Events ──────────────────────────────────────────────────────
 

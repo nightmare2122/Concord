@@ -23,6 +23,10 @@ if [ ! -f ".env" ]; then
     exit 1
 fi
 
+# Ensure required runtime directories exist
+mkdir -p Logs Archives/Tasks Database/"DAR exports"
+echo -e "${GREEN}✔ Runtime directories verified.${NC}"
+
 if [ ! -d ".venv" ]; then
     echo -e "${YELLOW}Initializing missing .venv...${NC}"
     python3 -m venv .venv
